@@ -36,6 +36,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <time.h>
+#include <LittleFS.h>
+#include <math.h>
 
 // ═══════════════════════════════════════════════════════════════════
 //  USER CONFIGURATION
@@ -53,13 +55,21 @@
 // --- WiFi (set credentials in config.h) ----------------------------
 #include "config.h"
 
-// --- Sensor read interval -------------------------------------------
-#define READ_INTERVAL_MS  1000   // every 1 second
+// --- Sensor read intervals -------------------------------------------
+#define READ_INTERVAL_MS  1000   // slow tasks (AHT21, time, display): every 1 s
+#define ENS160_POLL_MS    200    // ENS160 non-blocking poll (~5×/s; new data ~1×/s)
 
 // --- NTP time --------------------------------------------------------
 #define TZ_OFFSET_SEC  (8 * 3600)   // UTC+8 (China) — change for your zone
 #define NTP_SERVER1    "ntp2.aliyun.com"
 #define NTP_SERVER2    "ntp3.aliyun.com"
+
+// --- Data logging (LittleFS; requires "No OTA (2MB APP/2MB SPIFFS)" ---
+// --- partition scheme in Arduino IDE) --------------------------------
+#define LOG_DIR            "/log"
+#define LOG_INTERVAL_S     60           // append a record every minute
+#define LOG_RETENTION_DAYS 30           // keep the last N days (ring buffer)
+#define HISTORY_MAX_BINS   1200         // max curve points returned by /history
 
 // ═══════════════════════════════════════════════════════════════════
 //  GLOBALS
@@ -84,7 +94,10 @@ struct {
   uint8_t  aqi         = 0;      // 1–5 (0 = invalid)
   bool     aht_ok      = false;
   bool     ens160_ok   = false;
-  uint32_t last_read_ms = 0;
+  uint32_t last_read_ms     = 0;  // slow task (1 s)
+  uint32_t last_ens_poll_ms = 0;  // ENS160 non-blocking poll (~200 ms)
+  uint32_t last_log_ms      = 0;  // data log record (every LOG_INTERVAL_S)
+  uint32_t last_prune_ms    = 0;  // log retention cleanup (hourly)
   // Min/Max tracking
   float    temp_min = 999.0f,  temp_max = -999.0f;
   float    hum_min  = 999.0f,  hum_max  = -999.0f;
@@ -159,6 +172,53 @@ const char index_html[] PROGMEM = R"rawliteral(
   .aq-3 { color: #FFD600; }  .bg-3 { background: #FFD600; }
   .aq-4 { color: #FF9100; }  .bg-4 { background: #FF9100; }
   .aq-5 { color: #FF1744; }  .bg-5 { background: #FF1744; }
+
+  /* Clickable data cards (open history chart) */
+  .card.clickable { cursor: pointer; transition: transform .15s ease, box-shadow .15s ease; }
+  .card.clickable:active { transform: scale(.97); }
+  .card.clickable:hover { box-shadow: 0 6px 24px rgba(0,0,0,.5); }
+  .card.clickable:hover .card-label { opacity: .8; }
+
+  /* History modal */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(4,4,12,.74);
+    display: none; align-items: center; justify-content: center;
+    padding: 16px; z-index: 50;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    width: 100%; max-width: 520px; background: #14142b; border-radius: 24px;
+    padding: 20px; box-shadow: 0 12px 40px rgba(0,0,0,.6);
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; }
+  .modal-title { font-size: 18px; font-weight: 700; }
+  .modal-close { background: none; border: none; color: #e0e0e0; font-size: 24px;
+                 line-height: 1; cursor: pointer; padding: 4px 10px; border-radius: 8px; }
+  .modal-close:hover { background: rgba(255,255,255,.08); }
+  .range-btns { display: flex; gap: 8px; }
+  .range-btn {
+    background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.08);
+    color: #e0e0e0; border-radius: 999px; padding: 6px 14px; font-size: 13px; cursor: pointer;
+  }
+  .range-btn.active { background: rgba(255,255,255,.16); border-color: rgba(255,255,255,.35); }
+  .chart-stats { display: flex; gap: 14px; font-size: 12px; opacity: .75; flex-wrap: wrap; }
+  .chart-stats b { font-size: 15px; }
+  .chart-wrap { position: relative; width: 100%; height: 260px; }
+  .chart-wrap canvas { width: 100%; height: 100%; display: block; }
+  .chart-tip {
+    position: absolute; display: none; pointer-events: none;
+    background: rgba(0,0,0,.82); border: 1px solid rgba(255,255,255,.12);
+    border-radius: 8px; padding: 6px 10px; font-size: 12px; white-space: nowrap;
+  }
+  .export-btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1);
+    color: #e0e0e0; border-radius: 999px; padding: 8px 16px; font-size: 13px;
+    text-decoration: none; align-self: center; transition: background .15s ease;
+  }
+  .export-btn:hover { background: rgba(255,255,255,.12); }
+  .export-sm { padding: 6px 12px; font-size: 12px; margin-left: auto; }
 </style>
 </head>
 <body>
@@ -171,34 +231,56 @@ const char index_html[] PROGMEM = R"rawliteral(
     <div class="aqi-bar"><div class="aqi-fill" id="aqi-fill"></div></div>
   </div>
   <div class="grid">
-    <div class="card">
+    <div class="card clickable" onclick="openHistory('temp')">
       <div class="card-label">Temperature</div>
       <div class="card-value"><span id="temp">--</span><span class="card-unit">°C</span></div>
       <div class="card-minmax">↓<span class="min" id="temp-min">--</span> <span class="min-time" id="temp-min-t">--/-- --:--</span></div>
       <div class="card-minmax">↑<span class="max" id="temp-max">--</span> <span class="max-time" id="temp-max-t">--/-- --:--</span></div>
     </div>
-    <div class="card">
+    <div class="card clickable" onclick="openHistory('hum')">
       <div class="card-label">Humidity</div>
       <div class="card-value"><span id="hum">--</span><span class="card-unit">%</span></div>
       <div class="card-minmax">↓<span class="min" id="hum-min">--</span> <span class="min-time" id="hum-min-t">--/-- --:--</span></div>
       <div class="card-minmax">↑<span class="max" id="hum-max">--</span> <span class="max-time" id="hum-max-t">--/-- --:--</span></div>
     </div>
-    <div class="card">
+    <div class="card clickable" onclick="openHistory('eco2')">
       <div class="card-label">eCO₂</div>
       <div class="card-value"><span id="eco2">--</span><span class="card-unit">ppm</span></div>
       <div class="card-minmax">↓<span class="min" id="eco2-min">--</span> <span class="min-time" id="eco2-min-t">--/-- --:--</span></div>
       <div class="card-minmax">↑<span class="max" id="eco2-max">--</span> <span class="max-time" id="eco2-max-t">--/-- --:--</span></div>
     </div>
-    <div class="card">
+    <div class="card clickable" onclick="openHistory('tvoc')">
       <div class="card-label">TVOC</div>
       <div class="card-value"><span id="tvoc">--</span><span class="card-unit">ppb</span></div>
       <div class="card-minmax">↓<span class="min" id="tvoc-min">--</span> <span class="min-time" id="tvoc-min-t">--/-- --:--</span></div>
       <div class="card-minmax">↑<span class="max" id="tvoc-max">--</span> <span class="max-time" id="tvoc-max-t">--/-- --:--</span></div>
     </div>
   </div>
+
+  <!-- History chart modal -->
+  <div class="modal-overlay" id="modal" onclick="if(event.target===this)closeHistory()">
+    <div class="modal">
+      <div class="modal-head">
+        <div class="modal-title" id="modal-title">History</div>
+        <button class="modal-close" onclick="closeHistory()">×</button>
+      </div>
+      <div class="range-btns">
+        <button class="range-btn active" onclick="setRange(1)">24H</button>
+        <button class="range-btn" onclick="setRange(7)">7D</button>
+        <button class="range-btn" onclick="setRange(30)">30D</button>
+        <a class="export-btn export-sm" id="export-range" href="/export?days=1" download="aq_log.csv">⬇ 导出该区间</a>
+      </div>
+      <div class="chart-stats" id="chart-stats"></div>
+      <div class="chart-wrap">
+        <canvas id="chart-canvas"></canvas>
+        <div class="chart-tip" id="chart-tip"></div>
+      </div>
+    </div>
+  </div>
   <div class="status">
     <span class="dot"></span><span id="status-text">Connected</span>
   </div>
+  <a class="export-btn" href="/export" download="aq_log.csv">⬇ 导出 CSV</a>
 </div>
 
 <script>
@@ -261,6 +343,153 @@ const char index_html[] PROGMEM = R"rawliteral(
     setTimeout(poll, 1000);
   }
   poll();
+
+  // ── History charts (hand-rolled <canvas>, no external libs) ─────────
+  const METRICS = {
+    temp: { label: 'Temperature', unit: '°C',  color: '#FF8A65', digits: 1 },
+    hum:  { label: 'Humidity',    unit: '%',   color: '#4FC3F7', digits: 1 },
+    eco2: { label: 'eCO₂',        unit: 'ppm', color: '#FFD600', digits: 0 },
+    tvoc: { label: 'TVOC',        unit: 'ppb', color: '#00E676', digits: 0 },
+  };
+  const RANGES = [1, 7, 30];
+  const PAD = { l: 44, r: 12, t: 12, b: 22 };
+
+  let chartMetric = 'temp';
+  let chartDays   = 1;
+  let chartData   = null;
+
+  const modal  = document.getElementById('modal');
+  const canvas = document.getElementById('chart-canvas');
+  const cctx   = canvas.getContext('2d');
+  const tip    = document.getElementById('chart-tip');
+
+  function openHistory(m) {
+    chartMetric = m;
+    chartDays   = 1;
+    document.getElementById('modal-title').textContent = METRICS[m].label + ' · History';
+    document.querySelectorAll('.range-btn').forEach((b, i) => b.classList.toggle('active', i === 0));
+    document.getElementById('export-range').href = '/export?days=' + chartDays;
+    modal.classList.add('open');
+    loadHistory();
+  }
+  function closeHistory() { modal.classList.remove('open'); }
+  function setRange(days) {
+    chartDays = days;
+    document.querySelectorAll('.range-btn').forEach((b, i) =>
+      b.classList.toggle('active', RANGES[i] === days));
+    document.getElementById('export-range').href = '/export?days=' + chartDays;
+    loadHistory();
+  }
+
+  async function loadHistory() {
+    try {
+      const r = await fetch('/history?metric=' + chartMetric + '&days=' + chartDays);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      chartData = await r.json();
+      renderChart();
+    } catch (e) { console.warn('history error:', e); }
+  }
+
+  const pad2 = n => String(n).padStart(2, '0');
+  function fmtT(t, mode) {
+    const d = new Date(t * 1000);
+    return mode === '24h'
+      ? pad2(d.getHours()) + ':' + pad2(d.getMinutes())
+      : pad2(d.getMonth() + 1) + '/' + pad2(d.getDate()) + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+
+  function getScale(pts, pad) {
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    const pw = W - pad.l - pad.r, ph = H - pad.t - pad.b;
+    let lo = Infinity, hi = -Infinity;
+    for (const p of pts) { if (p[1] < lo) lo = p[1]; if (p[1] > hi) hi = p[1]; }
+    if (lo === hi) { lo -= 1; hi += 1; }
+    const span = hi - lo; lo -= span * 0.08; hi += span * 0.08;
+    const t0 = pts[0][0], t1 = pts[pts.length - 1][0];
+    return {
+      W, H, pw, ph, lo, hi,
+      X: t => pad.l + (t - t0) / ((t1 - t0) || 1) * pw,
+      Y: v => pad.t + (hi - v) / (hi - lo) * ph,
+    };
+  }
+
+  function drawBase(M, pts) {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width  = Math.round(canvas.clientWidth * dpr);
+    canvas.height = Math.round(canvas.clientHeight * dpr);
+    cctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    cctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+
+    const sc = getScale(pts, PAD);
+    const mode = chartDays === 1 ? '24h' : 'multi';
+
+    cctx.font = '10px sans-serif';
+    cctx.textAlign = 'right'; cctx.textBaseline = 'middle';
+    for (let i = 0; i <= 4; i++) {
+      const v = sc.hi - (sc.hi - sc.lo) * i / 4, y = sc.Y(v);
+      cctx.strokeStyle = 'rgba(255,255,255,.07)';
+      cctx.beginPath(); cctx.moveTo(PAD.l, y); cctx.lineTo(PAD.l + sc.pw, y); cctx.stroke();
+      cctx.fillStyle = 'rgba(255,255,255,.45)';
+      cctx.fillText(v.toFixed(M.digits), PAD.l - 6, y);
+    }
+    cctx.textAlign = 'center'; cctx.textBaseline = 'top';
+    cctx.fillStyle = 'rgba(255,255,255,.45)';
+    for (let i = 0; i <= 4; i++) {
+      const t = sc.t0 + (sc.t1 - sc.t0) * i / 4;
+      cctx.fillText(fmtT(Math.round(t), mode), sc.X(t), PAD.t + sc.ph + 6);
+    }
+
+    cctx.beginPath();
+    pts.forEach((p, i) => i ? cctx.lineTo(sc.X(p[0]), sc.Y(p[1])) : cctx.moveTo(sc.X(p[0]), sc.Y(p[1])));
+    cctx.strokeStyle = M.color; cctx.lineWidth = 2;
+    cctx.lineJoin = 'round'; cctx.lineCap = 'round';
+    cctx.stroke();
+    cctx.lineTo(sc.X(sc.t1), sc.Y(sc.lo)); cctx.lineTo(sc.X(sc.t0), sc.Y(sc.lo)); cctx.closePath();
+    cctx.fillStyle = M.color; cctx.globalAlpha = .12; cctx.fill(); cctx.globalAlpha = 1;
+  }
+
+  function renderChart() {
+    const M = METRICS[chartMetric];
+    const pts = (chartData && chartData.points) ? chartData.points : [];
+    const stats = document.getElementById('chart-stats');
+    if (!pts.length) {
+      cctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+      stats.textContent = '暂无数据 —— 等待下一次每分钟记录';
+      return;
+    }
+    stats.innerHTML = '';
+    const addStat = (l, v) => { const s = document.createElement('span'); s.innerHTML = l + ' <b>' + v + '</b>'; stats.appendChild(s); };
+    addStat('min ', chartData.min);
+    addStat('avg ', chartData.avg);
+    addStat('max ', chartData.max);
+    addStat('N ', chartData.count);
+
+    drawBase(M, pts);
+    canvas.onmousemove = e => hover(e, M, pts);
+    canvas.onmouseleave = () => { tip.style.display = 'none'; if (pts.length) drawBase(M, pts); };
+  }
+
+  function hover(e, M, pts) {
+    const sc = getScale(pts, PAD);
+    const mode = chartDays === 1 ? '24h' : 'multi';
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    let best = 0, bd = 1e9;
+    for (let i = 0; i < pts.length; i++) { const d = Math.abs(sc.X(pts[i][0]) - mx); if (d < bd) { bd = d; best = i; } }
+    drawBase(M, pts);
+    const p = pts[best], tx = sc.X(p[0]);
+    cctx.strokeStyle = 'rgba(255,255,255,.25)';
+    cctx.beginPath(); cctx.moveTo(tx, sc.Y(sc.lo)); cctx.lineTo(tx, sc.Y(sc.hi)); cctx.stroke();
+    cctx.fillStyle = M.color;
+    cctx.beginPath(); cctx.arc(tx, sc.Y(p[1]), 3, 0, 6.2832); cctx.fill();
+    tip.style.display = 'block';
+    tip.style.left = Math.min(Math.max(tx + 12, 0), sc.W - 90) + 'px';
+    tip.style.top = Math.max(sc.Y(p[1]) - 24, 0) + 'px';
+    tip.textContent = fmtT(p[0], mode) + '  ' + p[1].toFixed(M.digits) + ' ' + M.unit;
+  }
+
+  window.addEventListener('resize', () => { if (modal.classList.contains('open')) renderChart(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeHistory(); });
 </script>
 </body>
 </html>
@@ -345,6 +574,313 @@ void handleNotFound() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  DATA LOGGING (LittleFS)  — one binary file per calendar day
+// ═══════════════════════════════════════════════════════════════════
+//  Record (12 bytes, little-endian):
+//    uint32_t t;     // unix epoch seconds
+//    uint16_t eco2;  // ppm
+//    uint16_t tvoc;  // ppb
+//    int16_t  temp;  // °C × 10
+//    uint16_t rh;    // % RH × 10
+//  Ring buffer = keep only the last LOG_RETENTION_DAYS day-files.
+
+#pragma pack(push, 1)
+struct LogRec {
+  uint32_t t;
+  uint16_t eco2;
+  uint16_t tvoc;
+  int16_t  temp;
+  uint16_t rh;
+};
+#pragma pack(pop)
+
+// Path like "/log/20260731.bin" for a given epoch time.
+String logPathForDay(time_t t) {
+  struct tm *ti = localtime(&t);
+  char buf[20];
+  strftime(buf, sizeof(buf), "/log/%Y%m%d.bin", ti);
+  return String(buf);
+}
+
+void initStorage() {
+  if (!LittleFS.begin(true)) {              // format on first failure
+    Serial.println("FAIL: LittleFS mount (check partition scheme)");
+    return;
+  }
+  LittleFS.mkdir(LOG_DIR);
+  Serial.println("OK:  LittleFS mounted");
+  pruneLogs();
+}
+
+// Delete day files older than the retention window. Only runs once time
+// is synced, so we never delete based on a bogus pre-NTP clock.
+void pruneLogs() {
+  if (!data.time_synced) return;
+
+  // Cutoff = start (00:00 local) of (RETENTION-1) days ago, so we keep
+  // exactly LOG_RETENTION_DAYS calendar-day files (today .. RETENTION-1 ago).
+  time_t now = time(nullptr);
+  struct tm tn;
+  localtime_r(&now, &tn);
+  tn.tm_hour = 0; tn.tm_min = 0; tn.tm_sec = 0;
+  time_t cutoff = mktime(&tn) - (time_t)(LOG_RETENTION_DAYS - 1) * 86400L;
+
+  File root = LittleFS.open(LOG_DIR);
+  if (!root || !root.isDirectory()) return;
+
+  File f = root.openNextFile();
+  while (f) {
+    String path = String(f.path());
+    String name = String(f.name());         // e.g. "20260731.bin"
+    f.close();                              // close before removing
+    if (name.length() == 12 && name.endsWith(".bin")) {
+      int y = name.substring(0, 4).toInt();
+      int mo = name.substring(4, 6).toInt();
+      int d  = name.substring(6, 8).toInt();
+      if (y >= 2000) {
+        struct tm tm0 = {0};
+        tm0.tm_year = y - 1900;
+        tm0.tm_mon  = mo - 1;
+        tm0.tm_mday = d;
+        time_t ft = mktime(&tm0);
+        if (ft != (time_t)-1 && ft < cutoff) {
+          LittleFS.remove(path);
+          Serial.printf("LOG: pruned %s\n", name.c_str());
+        }
+      }
+    }
+    f = root.openNextFile();
+  }
+  root.close();
+}
+
+// Append one 12-byte record to today's file. Only called when time is
+// synced and both sensors have valid data (see loop()).
+void appendLogRecord() {
+  LogRec r;
+  r.t    = (uint32_t)time(nullptr);
+  r.eco2 = data.eco2;
+  r.tvoc = data.tvoc;
+  r.temp = (int16_t)roundf(data.temperature * 10.0f);
+  r.rh   = (uint16_t)roundf(data.humidity * 10.0f);
+
+  File f = LittleFS.open(logPathForDay(r.t), FILE_APPEND);
+  if (!f) {
+    Serial.println("LOG: append open failed");
+    return;
+  }
+  f.write((const uint8_t *)&r, sizeof(r));
+  f.close();
+}
+
+// GET /history?metric={eco2|tvoc|temp|hum}&days={1..30}  (default days=1)
+// Returns a downsampled time series over the last `days` days. Binning is
+// done incrementally so RAM use is bounded regardless of how much data is
+// stored (HISTORY_MAX_BINS × 16 B on the heap).
+void handleHistory() {
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+
+  // --- parse args ---------------------------------------------------
+  char metric = 'e';
+  if (server.hasArg("metric")) {
+    String m = server.arg("metric");
+    metric = m.length() ? m.charAt(0) : 'e';
+    if (metric != 'e' && metric != 'v' && metric != 't' && metric != 'h') {
+      server.send(400, "text/plain", "400: bad metric");
+      return;
+    }
+  }
+  int days = 1;
+  if (server.hasArg("days")) {
+    days = server.arg("days").toInt();
+    if (days < 1 || days > LOG_RETENTION_DAYS) days = 1;
+  }
+
+  // --- window -------------------------------------------------------
+  time_t now = time(nullptr);
+  if (!data.time_synced || now < 1700000000) {
+    server.send(200, "application/json; charset=utf-8",
+                "{\"metric\":\"\",\"unit\":\"\",\"digits\":0,\"points\":[],\"min\":0,\"max\":0,\"avg\":0,\"count\":0}");
+    return;
+  }
+  uint32_t start = (uint32_t)(now - (time_t)days * 86400L);
+
+  // --- metric metadata ----------------------------------------------
+  String metricName; const char *unit; int digits;
+  if      (metric == 'v') { metricName = "tvoc"; unit = "ppb"; digits = 0; }
+  else if (metric == 't') { metricName = "temp"; unit = "°C";  digits = 1; }
+  else if (metric == 'h') { metricName = "hum";  unit = "%RH"; digits = 1; }
+  else                    { metricName = "eco2"; unit = "ppm"; digits = 0; }
+
+  // --- incremental binning -------------------------------------------
+  struct Bin { uint32_t t0; uint32_t count; double sum; };
+  Bin *bins = (Bin *)calloc(HISTORY_MAX_BINS, sizeof(Bin));
+  if (!bins) {
+    server.send(500, "text/plain", "500: no memory");
+    return;
+  }
+  int nbins = 0;
+
+  double vsum = 0; uint32_t vcnt = 0;
+  float  vmin = 1e30f, vmax = -1e30f;
+
+  uint32_t binSec = ((uint32_t)days * 86400UL + HISTORY_MAX_BINS - 1) / HISTORY_MAX_BINS;
+  if (binSec == 0) binSec = 1;
+
+  // Read enough day-files to cover the rolling window (today .. days ago).
+  for (int d = 0; d <= days; ++d) {
+    time_t day = now - (time_t)d * 86400L;
+    File f = LittleFS.open(logPathForDay(day), FILE_READ);
+    if (!f) continue;
+    LogRec r;
+    while (f.read((uint8_t *)&r, sizeof(r)) == (int)sizeof(r)) {
+      if (r.t < start || r.t > (uint32_t)now) continue;
+      float v;
+      switch (metric) {
+        case 'e': v = (float)r.eco2; break;
+        case 'v': v = (float)r.tvoc; break;
+        case 't': v = r.temp / 10.0f; break;
+        default:  v = r.rh   / 10.0f; break;
+      }
+      vsum += v; vcnt++;
+      if (v < vmin) vmin = v;
+      if (v > vmax) vmax = v;
+
+      uint32_t idx = (r.t - start) / binSec;
+      if ((int)idx >= HISTORY_MAX_BINS) idx = HISTORY_MAX_BINS - 1;
+      if ((int)idx >= nbins) {
+        for (int k = nbins; k <= (int)idx; ++k) {
+          bins[k].t0    = start + k * binSec;
+          bins[k].count = 0;
+          bins[k].sum   = 0;
+        }
+        nbins = (int)idx + 1;
+      }
+      bins[idx].sum += v;
+      bins[idx].count++;
+    }
+    f.close();
+  }
+
+  // --- build JSON ----------------------------------------------------
+  String json;
+  json.reserve(HISTORY_MAX_BINS * 24 + 64);
+  json = "{\"metric\":\"" + metricName + "\",\"unit\":\"" + unit;
+  json += "\",\"digits\":";
+  json += digits;
+  json += ",\"points\":[";
+  bool first = true;
+  for (int i = 0; i < nbins; ++i) {
+    if (bins[i].count == 0) continue;
+    if (!first) json += ",";
+    first = false;
+    json += "[";
+    json += (unsigned long)bins[i].t0;
+    json += ",";
+    json += String(bins[i].sum / bins[i].count, digits);
+    json += "]";
+  }
+  json += "],\"min\":";
+  json += (vcnt ? String(vmin, digits) : String("0"));
+  json += ",\"max\":";
+  json += (vcnt ? String(vmax, digits) : String("0"));
+  json += ",\"avg\":";
+  json += (vcnt ? String(vsum / vcnt, digits) : String("0"));
+  json += ",\"count\":";
+  json += (unsigned long)vcnt;
+  json += "}";
+
+  free(bins);
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+// GET /export[?days={1..30}]  — download all logged data as CSV.
+// Streams via chunked transfer (chunkResponseBegin/Write/End) so the full
+// 30-day history (~1.7 MB) can be served without building it all in RAM.
+void handleExport() {
+  int days = LOG_RETENTION_DAYS;
+  if (server.hasArg("days")) {
+    days = server.arg("days").toInt();
+    if (days < 1 || days > LOG_RETENTION_DAYS) days = LOG_RETENTION_DAYS;
+  }
+  time_t now = time(nullptr);
+  time_t start = 0;
+  if (data.time_synced && now >= 1700000000)
+    start = now - (time_t)days * 86400L;
+
+  // Collect day-files and sort them oldest → newest (YYYYMMDD sorts lexically).
+  String files[LOG_RETENTION_DAYS + 1];
+  int nfiles = 0;
+  File root = LittleFS.open(LOG_DIR);
+  if (root && root.isDirectory()) {
+    File f = root.openNextFile();
+    while (f && nfiles < (int)(sizeof(files) / sizeof(files[0]))) {
+      String name = String(f.name());
+      if (name.length() == 12 && name.endsWith(".bin")) files[nfiles++] = name;
+      f = root.openNextFile();
+    }
+    root.close();
+  }
+  for (int i = 1; i < nfiles; i++) {          // insertion sort by name
+    String key = files[i];
+    int j = i - 1;
+    while (j >= 0 && files[j] > key) { files[j + 1] = files[j]; j--; }
+    files[j + 1] = key;
+  }
+
+  server.sendHeader("Content-Disposition", "attachment; filename=aq_log.csv");
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.chunkResponseBegin("text/csv");
+
+  // Small output buffer flushed to the client whenever it fills up.
+  char buf[2048];
+  int used = 0;
+  auto flush = [&]() {
+    if (used > 0) { server.chunkWrite(buf, used); used = 0; }
+  };
+  auto emit = [&](const char *s) {
+    while (*s) {
+      if (used == (int)sizeof(buf)) flush();
+      buf[used++] = *s++;
+    }
+  };
+
+  emit("timestamp_iso,timestamp_unix,eco2_ppm,tvoc_ppb,temp_c,hum_pct\r\n");
+
+  char row[80];
+  char iso[24];
+  unsigned long rows = 0;
+  for (int i = 0; i < nfiles; i++) {
+    String path = String(LOG_DIR) + "/" + files[i];
+    File f = LittleFS.open(path, FILE_READ);
+    if (!f) continue;
+    LogRec r;
+    while (f.read((uint8_t *)&r, sizeof(r)) == (int)sizeof(r)) {
+      if (r.t == 0 || (start && r.t < (uint32_t)start)) continue;
+      time_t tt = (time_t)r.t;
+      struct tm *ti = localtime(&tt);
+      strftime(iso, sizeof(iso), "%Y-%m-%d %H:%M:%S", ti);
+      int rlen = snprintf(row, sizeof(row),
+                          "%s,%lu,%u,%u,%.1f,%.1f\r\n",
+                          iso, (unsigned long)r.t, (unsigned)r.eco2,
+                          (unsigned)r.tvoc, r.temp / 10.0f, r.rh / 10.0f);
+      if (rlen >= (int)sizeof(row)) rlen = (int)sizeof(row) - 1;
+      row[rlen] = '\0';
+      emit(row);
+      rows++;
+    }
+    f.close();
+  }
+  flush();
+  server.chunkResponseEnd();
+  Serial.printf("EXPORT: %lu rows\n", rows);
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  SENSOR HELPERS
 // ═══════════════════════════════════════════════════════════════════
 
@@ -402,7 +938,11 @@ bool readENS160() {
     ens160.set_envdata(data.temperature, data.humidity);
   }
 
-  if (!ens160.measure(true)) return false;
+  // Non-blocking: measure(false) returns true ONLY when a fresh sample is
+  // available — it never waits. ENS160 in STD mode produces a new reading
+  // ~1×/s, so we poll from loop() at ENS160_POLL_MS and the main loop (and
+  // therefore the web server) never gets blocked by the sensor.
+  if (!ens160.measure(false)) return false;
 
   uint8_t aqi_val = ens160.getAQI();
   if (aqi_val == 0 || aqi_val > 5) return false;
@@ -486,6 +1026,15 @@ void updateDisplay() {
     display.printf("%.1fC %.0f%%RH", data.temperature, data.humidity);
   } else {
     display.print("AHT21 --");
+  }
+
+  // Line 5: IP address
+  display.setCursor(0, 56);
+  display.print("IP ");
+  if (WiFi.status() == WL_CONNECTED) {
+    display.print(WiFi.localIP());
+  } else {
+    display.print("--");
   }
 
   display.display();
@@ -591,10 +1140,15 @@ void setup() {
     configTime(TZ_OFFSET_SEC, 0, NTP_SERVER1, NTP_SERVER2);
   }
 
+  // --- LittleFS data logging ---------------------------------------
+  initStorage();
+
   // --- Web server (built-in, no external libs) --------------------
   server.on("/",        handleRoot);
   server.on("/data",    handleData);
   server.on("/ip",      handleIP);
+  server.on("/history", handleHistory);
+  server.on("/export",  handleExport);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("Web server started");
@@ -609,8 +1163,21 @@ void setup() {
 // ═══════════════════════════════════════════════════════════════════
 
 void loop() {
+  // Serve web requests FIRST. Keeping this running continuously (never
+  // blocked by a sensor read) is what makes the dashboard refresh at ~1 Hz.
+  server.handleClient();
+
   uint32_t now = millis();
 
+  // ENS160 is polled non-blocking several times per second, so a fresh
+  // reading is picked up within ~ENS160_POLL_MS while the loop stays
+  // responsive to the web server.
+  if (now - data.last_ens_poll_ms >= ENS160_POLL_MS) {
+    data.last_ens_poll_ms = now;
+    readENS160();
+  }
+
+  // Slow 1 s tasks: clock string, AHT21, display, serial
   if (now - data.last_read_ms >= READ_INTERVAL_MS) {
     data.last_read_ms = now;
 
@@ -625,9 +1192,22 @@ void loop() {
     }
 
     readAHT21();
-    readENS160();
-
     updateDisplay();
+
+    // Append a log record every LOG_INTERVAL_S (only once time is synced
+    // and both sensors have produced valid data).
+    if (data.time_synced && data.aht_ok && data.ens160_ok &&
+        now - data.last_log_ms >= LOG_INTERVAL_S * 1000UL) {
+      data.last_log_ms = now;
+      appendLogRecord();
+    }
+
+    // Ring-buffer cleanup: run once right after NTP sync, then hourly.
+    if (data.time_synced && (now - data.last_prune_ms >= 3600UL * 1000UL ||
+                             data.last_prune_ms == 0)) {
+      data.last_prune_ms = now;
+      pruneLogs();
+    }
 
     // Serial debug
     if (data.ens160_ok || data.aht_ok) {
@@ -637,7 +1217,4 @@ void loop() {
                     data.temperature, data.humidity);
     }
   }
-
-  // Handle HTTP requests (built-in WebServer is non-blocking)
-  server.handleClient();
 }
