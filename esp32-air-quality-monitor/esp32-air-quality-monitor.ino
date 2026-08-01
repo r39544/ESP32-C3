@@ -3,36 +3,45 @@
  * ─────────────────────────────
  * Sensors:  ENS160 (VOC / eCO₂ / AQI)
  *            AHT21 (temperature / humidity)
- * Display:  SSD1306 OLED 128×64 (I²C)
+ * Display:  ST7789 TFT 240×320 (SPI)
  * Network:  WiFi + built-in WebServer (NO external libraries needed)
  *
- * Wiring (I²C bus — all three devices share the same SDA/SCL):
+ * Wiring — sensors on I²C bus (share SDA/SCL):
  *
- *   ESP32-C3 | ENS160 | AHT21 | SSD1306
- *   ─────────┼────────┼───────┼────────
- *   3V3      │ VIN    │ VIN   │ VCC
- *   GND      │ GND    │ GND   │ GND
- *   GPIO 4   │ SDA    │ SDA   │ SDA
- *   GPIO 5   │ SCL    │ SCL   │ SCL
+ *   ESP32-C3 | ENS160 | AHT21
+ *   ─────────┼────────┼───────
+ *   3V3      │ VIN    │ VIN
+ *   GND      │ GND    │ GND
+ *   GPIO 4   │ SDA    │ SDA
+ *   GPIO 5   │ SCL    │ SCL
  *
- *   I²C addresses:  ENS160 = 0x53
- *                   AHT21  = 0x38
- *                   SSD1306 = 0x3C
+ * Wiring — ST7789 TFT on SPI (board silkscreen: BL CS DC RST SDA SCL VCC GND):
+ *   (note: on this module "SDA" = SPI MOSI/DIN, "SCL" = SPI SCLK/CLK)
+ *
+ *   ESP32-C3 | ST7789 TFT
+ *   ─────────┼─────────
+ *   3V3      │ VCC
+ *   GND      │ GND
+ *   GPIO 8   │ SCL  (SCLK/CLK)
+ *   GPIO 6   │ SDA  (MOSI/DIN)
+ *   GPIO 10  │ CS
+ *   GPIO 7   │ DC
+ *   GPIO 9   │ RST
+ *   GPIO 3   │ BL   (or tie BL to 3V3 and set TFT_BL to -1)
+ *
+ *   I²C addresses:  ENS160 = 0x53,   AHT21 = 0x38
  *
  * ─── Board pin notes ────────────────
- *   Seeed XIAO C3:       SDA=4,  SCL=5   (selected below)
- *   ESP32-C3-DevKitM-1:  SDA=8,  SCL=9
- *   AirM2M C3:           SDA=6,  SCL=7
- *   Lolin C3 Mini:       SDA=8,  SCL=9
- *
- *   Change I2C_SDA / I2C_SCL below to match your board.
+ *   Wiring above is for Seeed XIAO ESP32-C3.
+ *   Other boards use different GPIOs — change TFT_* and I2C_* to match.
  */
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Adafruit_ST7789.h>
 #include <Adafruit_AHTX0.h>
 #include <ScioSense_ENS160.h>
+#include <SPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <time.h>
@@ -47,10 +56,16 @@
 #define I2C_SDA   4
 #define I2C_SCL   5
 
-// --- OLED ----------------------------------------------------------
-#define SCREEN_WIDTH  128
-#define SCREEN_HEIGHT 64
-#define OLED_ADDR     0x3C
+// --- TFT (ST7789 2.0" 240×320, SPI) --------------------------------
+#define TFT_SCLK  8
+#define TFT_MOSI  6
+#define TFT_CS   10
+#define TFT_DC    7
+#define TFT_RST   9
+#define TFT_BL    3    // -1 if the module ties backlight to 3V3
+#define TFT_W   240
+#define TFT_H   320
+#define TFT_SELFTEST  1  // 1 = flash red/green/blue at boot to verify SPI path
 
 // --- WiFi (set credentials in config.h) ----------------------------
 #include "config.h"
@@ -76,8 +91,8 @@
 //  GLOBALS
 // ═══════════════════════════════════════════════════════════════════
 
-// Display
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+// Display (ST7789 240×320 over SPI)
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
 // Sensors
 Adafruit_AHTX0    aht;
@@ -1044,65 +1059,231 @@ bool readENS160() {
 
 static const char *AQI_LABEL[] = {"--","Excellent","Good","Moderate","Poor","Unhealthy"};
 
+// RGB565 colour helper.
+static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
+static uint16_t aqiColor(uint8_t aqi) {
+  switch (aqi) {
+    case 1: return ST77XX_GREEN;
+    case 2: return rgb565(160, 240, 0);
+    case 3: return ST77XX_YELLOW;
+    case 4: return ST77XX_ORANGE;
+    case 5: return ST77XX_RED;
+    default: return rgb565(140, 148, 168);
+  }
+}
+
+// WiFi signal colour from strength percentage (0-100).
+static uint16_t wifiColor(int pct) {
+  if (pct >= 80) return ST77XX_GREEN;
+  if (pct >= 60) return rgb565(160, 240, 0);
+  if (pct >= 40) return ST77XX_YELLOW;
+  if (pct >= 20) return ST77XX_ORANGE;
+  return ST77XX_RED;
+}
+
+// One 2px-thick top arc drawn with short line segments (a basic primitive,
+// guaranteed to render on any display).
+void tftTopArc(int16_t cx, int16_t cy, int r, uint16_t color) {
+  // upper-left quarter arc (90° top → 180° left) = 90° CCW from before
+  for (int deg = 90; deg < 180; deg += 15) {
+    float a1 = (float)deg * PI / 180.0f;
+    float a2 = (float)(deg + 15) * PI / 180.0f;
+    tft.drawLine(cx + (int)(r * cos(a1)), cy - (int)(r * sin(a1)),
+                 cx + (int)(r * cos(a2)), cy - (int)(r * sin(a2)), color);
+  }
+}
+
+// Classic three-segment WiFi icon (dot + 3 arc bands). The stronger the
+// signal, the more bands are lit. Pass pct = -1 for a dim "off" icon.
+void tftDrawWifiIcon(int16_t x, int16_t y, int pct, uint16_t color) {
+  const uint16_t DIM = rgb565(70, 74, 90);
+  int level = pct >= 70 ? 3 : pct >= 40 ? 2 : pct >= 15 ? 1 : 0;
+  tft.fillCircle(x, y, 2, level > 0 ? color : DIM);
+  tftTopArc(x, y, 3, level >= 1 ? color : DIM);
+  tftTopArc(x, y, 7, level >= 2 ? color : DIM);
+  tftTopArc(x, y, 11, level >= 3 ? color : DIM);
+}
+
+// Static frame of one 2×2 card (background, border, label) — drawn once.
+void tftMetricCardFrame(int16_t x, int16_t y, const char *label) {
+  const uint16_t CARD   = rgb565(22, 24, 38);
+  const uint16_t BORDER = rgb565(52, 56, 76);
+  const uint16_t LABEL  = rgb565(140, 148, 168);
+
+  tft.fillRoundRect(x, y, 112, 64, 8, CARD);
+  tft.drawRoundRect(x, y, 112, 64, 8, BORDER);
+  tft.setTextSize(1);
+  tft.setTextColor(LABEL);
+  tft.setCursor(x + 8, y + 4);
+  tft.print(label);
+}
+
+// Refresh the dynamic text of one card (value/unit + L-min H-max).
+// Background-fill text + clear-rects avoid leftovers and flicker.
+void tftMetricCardValues(int16_t x, int16_t y, const char *unit,
+                         const char *value, const char *mn, const char *mx) {
+  const uint16_t CARD  = rgb565(22, 24, 38);
+  const uint16_t LABEL = rgb565(140, 148, 168);
+  const uint16_t MINC  = rgb565(120, 190, 240);
+  const uint16_t MAXC  = rgb565(255, 150, 120);
+
+  tft.fillRect(x + 6, y + 16, 100, 28, CARD);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_WHITE, CARD);
+  tft.setCursor(x + 8, y + 18);
+  tft.print(value);
+  tft.setTextSize(1);
+  tft.setTextColor(LABEL, CARD);
+  tft.setCursor(x + 8 + strlen(value) * 12 + 2, y + 24);
+  tft.print(unit);
+
+  tft.fillRect(x + 6, y + 44, 100, 10, CARD);
+  tft.setTextSize(1);
+  tft.setTextColor(MINC, CARD);
+  tft.setCursor(x + 8, y + 46);
+  tft.print("L");
+  tft.setCursor(x + 16, y + 46);
+  tft.print(mn);
+  tft.setTextColor(MAXC, CARD);
+  tft.setCursor(x + 58, y + 46);
+  tft.print("H");
+  tft.setCursor(x + 66, y + 46);
+  tft.print(mx);
+}
+
+// Draw the whole static frame once (background, cards, labels).
+void tftDrawLayout() {
+  const uint16_t BG     = ST77XX_BLACK;
+  const uint16_t CARD   = rgb565(22, 24, 38);
+  const uint16_t BORDER = rgb565(52, 56, 76);
+  const uint16_t LABEL  = rgb565(140, 148, 168);
+
+  tft.fillScreen(BG);
+
+  tft.fillRoundRect(10, 56, TFT_W - 20, 62, 10, CARD);
+  tft.drawRoundRect(10, 56, TFT_W - 20, 62, 10, BORDER);
+  tft.setTextSize(1);
+  tft.setTextColor(LABEL);
+  tft.setCursor(20, 62);
+  tft.print("AIR QUALITY");
+
+  tftMetricCardFrame(10, 132, "eCO2");
+  tftMetricCardFrame(118, 132, "TVOC");
+  tftMetricCardFrame(10, 208, "TEMP");
+  tftMetricCardFrame(118, 208, "HUM");
+}
+
+// Called every second — only redraws changed text, never clears the whole
+// screen (that full-screen clear was what caused the flicker).
 void updateDisplay() {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
+  const uint16_t BG    = ST77XX_BLACK;
+  const uint16_t CARD  = rgb565(22, 24, 38);
+  const uint16_t LABEL = rgb565(140, 148, 168);
 
-  // Line 0: Time — centred, size 2
-  display.setTextSize(2);
-  display.setCursor((SCREEN_WIDTH - strlen(data.time_str) * 12) / 2, 0);
-  display.print(data.time_str);
+  // ── Time ─────────────────────────────────────────────────────
+  tft.fillRect(0, 6, TFT_W, 34, BG);
+  tft.setTextSize(4);
+  tft.setTextColor(ST77XX_WHITE, BG);
+  tft.setCursor((TFT_W - strlen(data.time_str) * 24) / 2, 6);
+  tft.print(data.time_str);
 
-  // Line 1: AQI
-  display.setTextSize(1);
-  display.setCursor(0, 17);
-  display.print("AQI: ");
+  // ── Date ─────────────────────────────────────────────────────
+  tft.fillRect(0, 40, TFT_W, 8, BG);
+  tft.setTextSize(1);
+  tft.setTextColor(LABEL, BG);
+  if (data.time_synced) {
+    time_t t = time(nullptr);
+    struct tm *ti = localtime(&t);
+    char ds[16];
+    strftime(ds, sizeof(ds), "%Y-%m-%d", ti);
+    tft.setCursor((TFT_W - strlen(ds) * 6) / 2, 40);
+    tft.print(ds);
+  }
+
+  // ── AQI value + label ────────────────────────────────────────
+  tft.fillRect(10, 74, TFT_W - 20, 34, CARD);
   if (data.aqi >= 1 && data.aqi <= 5) {
-    display.print(data.aqi);
-    display.print(" ");
-    display.print(AQI_LABEL[data.aqi]);
+    uint16_t c = aqiColor(data.aqi);
+    tft.setTextSize(4);
+    tft.setTextColor(c, CARD);
+    tft.setCursor(20, 76);
+    tft.print(data.aqi);
+    tft.setTextSize(3);
+    tft.setCursor(58, 82);
+    tft.print(AQI_LABEL[data.aqi]);
   } else {
-    display.print("--");
+    tft.setTextSize(4);
+    tft.setTextColor(LABEL, CARD);
+    tft.setCursor(20, 76);
+    tft.print("--");
   }
 
-  // Line 2: eCO₂
-  display.setCursor(0, 27);
-  display.print("eCO2: ");
-  if (data.ens160_ok) {
-    display.print(data.eco2);
-    display.print(" ppm");
-  } else {
-    display.print("--");
-  }
+  // ── metric values + min/max ──────────────────────────────────
+  char b[12], mn[12], mx[12];
 
-  // Line 3: TVOC
-  display.setCursor(0, 37);
-  display.print("TVOC: ");
-  if (data.ens160_ok) {
-    display.print(data.tvoc);
-    display.print(" ppb");
-  } else {
-    display.print("--");
-  }
+  if (data.ens160_ok) snprintf(b, sizeof(b), "%u", data.eco2); else strcpy(b, "--");
+  snprintf(mn, sizeof(mn), "%u", data.eco2_min);
+  snprintf(mx, sizeof(mx), "%u", data.eco2_max);
+  tftMetricCardValues(10, 132, "ppm", b, mn, mx);
 
-  // Line 4: Temperature & Humidity
-  display.setCursor(0, 47);
-  if (data.aht_ok) {
-    display.printf("%.1fC %.0f%%RH", data.temperature, data.humidity);
-  } else {
-    display.print("AHT21 --");
-  }
+  if (data.ens160_ok) snprintf(b, sizeof(b), "%u", data.tvoc); else strcpy(b, "--");
+  snprintf(mn, sizeof(mn), "%u", data.tvoc_min);
+  snprintf(mx, sizeof(mx), "%u", data.tvoc_max);
+  tftMetricCardValues(118, 132, "ppb", b, mn, mx);
 
-  // Line 5: IP address
-  display.setCursor(0, 56);
-  display.print("IP ");
+  if (data.aht_ok) snprintf(b, sizeof(b), "%.1f", data.temperature); else strcpy(b, "--");
+  snprintf(mn, sizeof(mn), data.temp_min > 990 ? "--" : "%.1f", data.temp_min);
+  snprintf(mx, sizeof(mx), data.temp_max < -990 ? "--" : "%.1f", data.temp_max);
+  tftMetricCardValues(10, 208, "C", b, mn, mx);
+
+  if (data.aht_ok) snprintf(b, sizeof(b), "%.0f", data.humidity); else strcpy(b, "--");
+  snprintf(mn, sizeof(mn), data.hum_min > 990 ? "--" : "%.0f", data.hum_min);
+  snprintf(mx, sizeof(mx), data.hum_max < -990 ? "--" : "%.0f", data.hum_max);
+  tftMetricCardValues(118, 208, "%", b, mn, mx);
+
+  // ── Bottom area: SSID (line above), IP (centre), % (left), icon (right) ─
+  tft.fillRect(0, 272, TFT_W, 36, BG);
+  tft.setTextSize(1);
   if (WiFi.status() == WL_CONNECTED) {
-    display.print(WiFi.localIP());
-  } else {
-    display.print("--");
-  }
+    int rssi = WiFi.RSSI();
+    int pct  = constrain(map(rssi, -90, -35, 0, 100), 0, 100);
+    uint16_t c = wifiColor(pct);
 
-  display.display();
+    // SSID (centred, above the bottom row)
+    tft.setTextColor(ST77XX_GREEN, BG);
+    String ssid = WiFi.SSID();
+    tft.setCursor((TFT_W - ssid.length() * 6) / 2, 278);
+    tft.print(ssid);
+
+    // IP (centred)
+    tft.setTextColor(ST77XX_GREEN, BG);
+    String ip = WiFi.localIP().toString();
+    tft.setCursor((TFT_W - ip.length() * 6) / 2, 296);
+    tft.print(ip);
+
+    // signal % (bottom-left)
+    tft.setTextColor(c, BG);
+    tft.setCursor(4, 296);
+    tft.print(pct);
+    tft.print("%");
+
+    // WiFi icon (bottom-right)
+    tftDrawWifiIcon(TFT_W - 16, 302, pct, c);
+  } else {
+    const char *ns = "WiFi: no connection";
+    tft.setTextColor(ST77XX_GREEN, BG);
+    tft.setCursor((TFT_W - strlen(ns) * 6) / 2, 296);
+    tft.print(ns);
+
+    tft.setTextColor(rgb565(140, 148, 168), BG);
+    tft.setCursor(4, 296);
+    tft.print("--%");
+
+    tftDrawWifiIcon(TFT_W - 16, 302, -1, rgb565(70, 74, 90));
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1119,27 +1300,39 @@ void setup() {
   Wire.setClock(400000);
   Serial.printf("I²C: SDA=%d  SCL=%d\n", I2C_SDA, I2C_SCL);
 
-  // --- OLED -------------------------------------------------------
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println("FAIL: SSD1306 not found");
-  } else {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println("AQ Monitor");
-    display.println("Booting...");
-    display.display();
-    Serial.println("OK:  SSD1306");
+  // --- TFT (ST7789 240×320, SPI) ----------------------------------
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
+  tft.init(TFT_W, TFT_H);
+  tft.setRotation(0);
+  tft.setTextWrap(false);
+  if (TFT_BL >= 0) {
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH);
   }
+  tft.fillScreen(ST77XX_BLACK);
+#if TFT_SELFTEST
+  // Power-on self-test: flash full-screen colours to verify the SPI path.
+  tft.fillScreen(ST77XX_RED);    delay(400);
+  tft.fillScreen(ST77XX_GREEN);  delay(400);
+  tft.fillScreen(ST77XX_BLUE);   delay(400);
+  tft.fillScreen(ST77XX_BLACK);
+#endif
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(28, 40);
+  tft.print("AQ Monitor");
+  tft.setTextSize(1);
+  tft.setCursor(28, 72);
+  tft.print("Booting...");
+  Serial.println("OK:  TFT ST7789");
 
   // --- AHT21 ------------------------------------------------------
   if (!initAHT21()) {
     Serial.println("FAIL: AHT21 not found");
-    display.fillRect(0, 0, 128, 64, 0);
-    display.setCursor(0, 0);
-    display.println("AHT21 FAIL");
-    display.display();
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_RED);
+    tft.setCursor(8, 100);
+    tft.print("AHT21 FAIL");
   } else {
     Serial.println("OK:  AHT21");
   }
@@ -1152,10 +1345,11 @@ void setup() {
   }
 
   // --- WiFi -------------------------------------------------------
-  display.fillRect(0, 0, 128, 64, 0);
-  display.setCursor(0, 0);
-  display.println("Connecting WiFi...");
-  display.display();
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(8, 20);
+  tft.print("Connecting WiFi...");
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -1164,20 +1358,21 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) {
     delay(300);
     Serial.print(".");
-    display.setCursor(0, 12);
-    display.print("SSID: ");
-    display.print(WIFI_SSID);
-    display.setCursor(0, 24);
-    display.print(dot % 4 == 0 ? "    " : dot % 4 == 1 ? ".   " :
-                  dot % 4 == 2 ? "..  " : "... ");
+    tft.setCursor(8, 36);
+    tft.print("SSID: ");
+    tft.print(WIFI_SSID);
+    tft.setCursor(8, 52);
+    tft.print(dot % 4 == 0 ? "    " : dot % 4 == 1 ? ".   " :
+              dot % 4 == 2 ? "..  " : "... ");
     dot++;
-    display.display();
     if (dot > 60) {
-      display.fillRect(0, 0, 128, 64, 0);
-      display.setCursor(0, 0);
-      display.println("WiFi FAIL");
-      display.println("Check credentials");
-      display.display();
+      tft.fillScreen(ST77XX_BLACK);
+      tft.setTextColor(ST77XX_RED);
+      tft.setCursor(8, 40);
+      tft.print("WiFi FAIL");
+      tft.setTextColor(ST77XX_WHITE);
+      tft.setCursor(8, 56);
+      tft.print("Check credentials");
       Serial.println("\nFAIL: WiFi connection timeout");
       break;
     }
@@ -1188,17 +1383,18 @@ void setup() {
                   WiFi.localIP().toString().c_str(),
                   WiFi.gatewayIP().toString().c_str(),
                   WiFi.dnsIP().toString().c_str());
-    display.fillRect(0, 0, 128, 64, 0);
-    display.setCursor(0, 0);
-    display.print("IP ");
-    display.print(WiFi.localIP());
-    display.setCursor(0, 16);
-    display.print("GW ");
-    display.print(WiFi.gatewayIP());
-    display.setCursor(0, 32);
-    display.print("DNS ");
-    display.print(WiFi.dnsIP());
-    display.display();
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(8, 16);
+    tft.print("IP  ");
+    tft.print(WiFi.localIP());
+    tft.setCursor(8, 32);
+    tft.print("GW  ");
+    tft.print(WiFi.gatewayIP());
+    tft.setCursor(8, 48);
+    tft.print("DNS ");
+    tft.print(WiFi.dnsIP());
 
     // --- NTP time sync (non-blocking: start SNTP, don't wait) -------
     Serial.println("NTP: started (background sync)");
@@ -1218,6 +1414,10 @@ void setup() {
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("Web server started");
+
+  // Draw the main UI frame once, then fill in current values.
+  tftDrawLayout();
+  updateDisplay();
 
   // --- Finish boot screen ------------------------------------------
   delay(1500);

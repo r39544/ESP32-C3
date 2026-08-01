@@ -1,27 +1,39 @@
 # ESP32-C3 空气质量监测仪
 
-基于 ESP32-C3 的空气监测站:**ENS160**(eCO₂ / TVOC / AQI)+ **AHT21**(温湿度),数据实时显示在 **SSD1306 OLED** 上,并内置一个 **Web 仪表盘**(无需外部前端依赖)。支持**历史数据记录与曲线查看、CSV 导出**。
+基于 ESP32-C3 的空气监测站:**ENS160**(eCO₂ / TVOC / AQI)+ **AHT21**(温湿度),数据实时显示在 **ST7789 2.0" 240×320 TFT** 上,并内置一个 **Web 仪表盘**(无需外部前端依赖)。支持**历史数据记录与曲线查看、CSV 导出**。
 
 ---
 
 ## 硬件接线
 
-三个 I²C 设备共用同一条 I²C 总线(SDA / SCL):
+### 传感器(I²C 总线,共用 SDA/SCL)
 
-| ESP32-C3 | ENS160 | AHT21 | SSD1306 |
-|----------|--------|-------|---------|
-| 3V3      | VIN    | VIN   | VCC     |
-| GND      | GND    | GND   | GND     |
-| GPIO 4   | SDA    | SDA   | SDA     |
-| GPIO 5   | SCL    | SCL   | SCL     |
+| ESP32-C3 | ENS160 | AHT21 |
+|----------|--------|-------|
+| 3V3      | VIN    | VIN   |
+| GND      | GND    | GND   |
+| GPIO 4   | SDA    | SDA   |
+| GPIO 5   | SCL    | SCL   |
 
-I²C 地址:ENS160 = `0x53`、AHT21 = `0x38`、SSD1306 = `0x3C`。
+I²C 地址:ENS160 = `0x53`、AHT21 = `0x38`。
 
-> 其它常见板子引脚(修改 `.ino` 中 `I2C_SDA` / `I2C_SCL`):
-> - Seeed XIAO C3: SDA=4, SCL=5(默认)
-> - ESP32-C3-DevKitM-1: SDA=8, SCL=9
-> - AirM2M C3: SDA=6, SCL=7
-> - Lolin C3 Mini: SDA=8, SCL=9
+### 显示屏(ST7789 240×320,SPI,板子丝印:BL CS DC RST SDA SCL VCC GND)
+
+> ⚠️ 此模块上的 **SDA = SPI MOSI(DIN)**、**SCL = SPI SCLK(CLK)**,不是 I²C。
+
+| ESP32-C3 | ST7789 TFT |
+|----------|-----------|
+| 3V3      | VCC        |
+| GND      | GND        |
+| GPIO 8   | SCL (SCLK) |
+| GPIO 6   | SDA (MOSI) |
+| GPIO 10  | CS         |
+| GPIO 7   | DC         |
+| GPIO 9   | RST        |
+| GPIO 3   | BL         |
+
+> 若模块的背光(BL)已直接接 3V3,把 `.ino` 中 `TFT_BL` 改成 `-1`。
+> 接线针对 **Seeed XIAO ESP32-C3**;其它板子请改 `.ino` 里的 `TFT_*` 与 `I2C_*` 引脚。
 
 ---
 
@@ -29,7 +41,8 @@ I²C 地址:ENS160 = `0x53`、AHT21 = `0x38`、SSD1306 = `0x3C`。
 
 ### 实时监测
 - 每秒刷新一次:温度、湿度、eCO₂、TVOC、AQI。
-- OLED 显示(5 行):时间 / AQI / eCO₂ / TVOC / 温湿度,最后一行显示 **IP 地址**。
+- TFT 显示(240×320 卡片布局):大号时间/日期、**彩色 AQI 卡**(绿/黄/橙/红随等级变化)、eCO₂/TVOC/温度/湿度 2×2 卡片(含 L/H 最值),底部显示 **SSID / IP / 信号强度**(SSID 一行,IP 居中,左下信号百分比、右下三段式 WiFi 图标,弧段按强度点亮)。
+- 屏幕采用**局部刷新**(只重画变化的数字),无整屏闪烁;开机有红/绿/蓝自检闪烁(`TFT_SELFTEST` 宏,可设为 0 关闭)。
 - Web 仪表盘(`http://<设备IP>`),深色卡片式,1 秒轮询刷新,纯 `fetch()` + 手写 CSS/JS,无外部 CDN。
 
 ### 历史数据记录(30 天环形)
@@ -40,8 +53,10 @@ I²C 地址:ENS160 = `0x53`、AHT21 = `0x38`、SSD1306 = `0x3C`。
 
 ### Web 历史曲线
 - 点击仪表盘上任意数据卡片(温度 / 湿度 / eCO₂ / TVOC)弹出历史曲线。
-- 支持 **24H / 7D / 30D** 切换,悬停显示该点时间与数值,附 min / avg / max 统计。
-- 曲线为手写 `<canvas>` 折线图,无第三方图表库。
+- **图表类型**:时间序列**折线图(Line Chart)** + 半透明面积填充,手写绘制在 HTML5 `<canvas>` 上,**无第三方图表库**。
+- **坐标轴**:X 轴为时间(24H 显示 `HH:MM`,7D/30D 显示 `MM/DD`),Y 轴为数值(5 档刻度)。
+- 数据由 `/history` 接口按时间分桶**平均降采样**(最多 1200 点;30 天视图聚合为约每 36 分钟 1 点),响应体积有上限。
+- 支持 **24H / 7D / 30D** 切换,鼠标悬停显示十字线与该点时间/数值,附 min / avg / max / 数据点数统计。
 
 ### CSV 导出
 - 仪表盘底部「⬇ 导出 CSV」:导出全部(保留的 30 天)数据。
@@ -71,7 +86,7 @@ I²C 地址:ENS160 = `0x53`、AHT21 = `0x38`、SSD1306 = `0x3C`。
 
 | 库 | 用于 |
 |----|------|
-| **Adafruit SSD1306** | OLED 驱动 |
+| **Adafruit ST7735 and ST7789 Library** | ST7789 TFT 驱动(库管理器里搜 "ST7735") |
 | **Adafruit GFX Library** | 图形基础库 |
 | **Adafruit AHTX0**(自动带 BusIO / Unified Sensor) | AHT21 温湿度 |
 | **ENS160 - Adafruit Fork**(或 ScioSense ENS160) | ENS160 气体传感器(代码 `#include <ScioSense_ENS160.h>`) |
@@ -87,7 +102,7 @@ I²C 地址:ENS160 = `0x53`、AHT21 = `0x38`、SSD1306 = `0x3C`。
 3. **工具 → Partition Scheme**:`No OTA (2MB APP/2MB SPIFFS)` ← **不选这个,`LittleFS.begin()` 会失败**
 4. **上传**。首次会串口打印 `OK: LittleFS mounted`(LittleFS 自动格式化)
 
-> 完整流程:复制 `config.h.example` 为 `config.h` 并填入 WiFi 账号密码 → 打开 `esp32-air-quality-monitor.ino` → 按上述 1–3 设置 → 上传 → 串口监视器(115200)确认 `OK: LittleFS mounted` 和 IP 地址;ENS160 约 3 分钟预热后开始输出读数。
+> 完整流程:复制 `config.h.example` 为 `config.h` 并填入 WiFi 账号密码 → 打开 `esp32-air-quality-monitor.ino` → 按上述 1–3 设置 → 上传 → 串口监视器(115200)确认 `OK: TFT ST7789`、`OK: LittleFS mounted` 和 IP 地址;ENS160 约 3 分钟预热后开始输出读数。
 
 ---
 
@@ -119,5 +134,6 @@ esp32-air-quality-monitor/
 ## 常见问题
 
 - **串口打印 `FAIL: LittleFS mount`** → 未选择 "No OTA" 分区方案,或 Flash Size 不是 4MB。
-- **页面打不开** → 确认 OLED 显示的 IP,浏览器访问 `http://<IP>`。
+- **页面打不开** → 确认 TFT 屏幕底部显示的 IP,浏览器访问 `http://<IP>`。
+- **屏幕白屏/不亮** → 检查 SPI 接线(SCLK/MOSI/CS/DC/RST)与 `TFT_*` 引脚定义是否匹配;背光 BL 未接的话把 `TFT_BL` 设为 `-1`。
 - **历史曲线没数据** → 需要先等 NTP 时间同步 + ENS160 预热完成,再等约 1 分钟产生第一条记录。
