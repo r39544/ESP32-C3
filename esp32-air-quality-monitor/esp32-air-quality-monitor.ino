@@ -70,6 +70,7 @@
 #define LOG_INTERVAL_S     60           // append a record every minute
 #define LOG_RETENTION_DAYS 30           // keep the last N days (ring buffer)
 #define HISTORY_MAX_BINS   1200         // max curve points returned by /history
+#define CLEAR_PASSWORD     "1234"       // password required to clear history (plaintext)
 
 // ═══════════════════════════════════════════════════════════════════
 //  GLOBALS
@@ -216,9 +217,13 @@ const char index_html[] PROGMEM = R"rawliteral(
     background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1);
     color: #e0e0e0; border-radius: 999px; padding: 8px 16px; font-size: 13px;
     text-decoration: none; align-self: center; transition: background .15s ease;
+    cursor: pointer;
   }
   .export-btn:hover { background: rgba(255,255,255,.12); }
   .export-sm { padding: 6px 12px; font-size: 12px; margin-left: auto; }
+  .export-btn.danger { border-color: rgba(255,82,82,.45); color: #ff8a8a; }
+  .export-btn.danger:hover { background: rgba(255,82,82,.12); }
+  .action-row { display: flex; justify-content: center; gap: 12px; }
 </style>
 </head>
 <body>
@@ -280,11 +285,17 @@ const char index_html[] PROGMEM = R"rawliteral(
   <div class="status">
     <span class="dot"></span><span id="status-text">Connected</span>
   </div>
-  <a class="export-btn" href="/export" download="aq_log.csv">⬇ 导出 CSV</a>
+  <div class="action-row">
+    <a class="export-btn" href="/export" download="aq_log.csv">⬇ 导出 CSV</a>
+    <button class="export-btn danger" onclick="clearHistory()">🗑 清除历史</button>
+  </div>
 </div>
 
 <script>
   const AQI_NAMES = ["Excellent","Good","Moderate","Poor","Unhealthy"];
+  // Hide sentinel min/max values (initial or after clear) instead of "999"/"65535".
+  const minTxt = (v, hi) => (v >= hi) ? '--' : v;
+  const maxTxt = (v, lo) => (v <= lo) ? '--' : v;
 
   function paint(d) {
     const v = d.aqi;
@@ -303,23 +314,23 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
     document.getElementById('time').textContent = d.time;
     document.getElementById('temp').textContent = d.temp;
-    document.getElementById('temp-min').textContent = d.temp_min;
-    document.getElementById('temp-max').textContent = d.temp_max;
+    document.getElementById('temp-min').textContent = minTxt(d.temp_min, 990);
+    document.getElementById('temp-max').textContent = maxTxt(d.temp_max, -990);
     document.getElementById('temp-min-t').textContent = d.temp_min_time;
     document.getElementById('temp-max-t').textContent = d.temp_max_time;
     document.getElementById('hum').textContent  = d.hum;
-    document.getElementById('hum-min').textContent = d.hum_min;
-    document.getElementById('hum-max').textContent = d.hum_max;
+    document.getElementById('hum-min').textContent = minTxt(d.hum_min, 990);
+    document.getElementById('hum-max').textContent = maxTxt(d.hum_max, -990);
     document.getElementById('hum-min-t').textContent = d.hum_min_time;
     document.getElementById('hum-max-t').textContent = d.hum_max_time;
     document.getElementById('eco2').textContent = d.eco2;
-    document.getElementById('eco2-min').textContent = d.eco2_min;
-    document.getElementById('eco2-max').textContent = d.eco2_max;
+    document.getElementById('eco2-min').textContent = minTxt(d.eco2_min, 50000);
+    document.getElementById('eco2-max').textContent = maxTxt(d.eco2_max, 0);
     document.getElementById('eco2-min-t').textContent = d.eco2_min_time;
     document.getElementById('eco2-max-t').textContent = d.eco2_max_time;
     document.getElementById('tvoc').textContent = d.tvoc;
-    document.getElementById('tvoc-min').textContent = d.tvoc_min;
-    document.getElementById('tvoc-max').textContent = d.tvoc_max;
+    document.getElementById('tvoc-min').textContent = minTxt(d.tvoc_min, 50000);
+    document.getElementById('tvoc-max').textContent = maxTxt(d.tvoc_max, 0);
     document.getElementById('tvoc-min-t').textContent = d.tvoc_min_time;
     document.getElementById('tvoc-max-t').textContent = d.tvoc_max_time;
     document.getElementById('status-text').textContent = 'Connected';
@@ -490,6 +501,22 @@ const char index_html[] PROGMEM = R"rawliteral(
 
   window.addEventListener('resize', () => { if (modal.classList.contains('open')) renderChart(); });
   document.addEventListener('keydown', e => { if (e.key === 'Escape') closeHistory(); });
+
+  function clearHistory() {
+    const pwd = prompt('输入密码以清除全部历史记录(此操作不可恢复):');
+    if (pwd === null) return;
+    fetch('/clear?pwd=' + encodeURIComponent(pwd), { method: 'POST' })
+      .then(r => r.json())
+      .then(d => {
+        if (d.ok) {
+          alert('已清除 ' + d.deleted + ' 个历史数据文件');
+          location.reload();
+        } else {
+          alert('密码错误,未清除');
+        }
+      })
+      .catch(() => alert('清除失败'));
+  }
 </script>
 </body>
 </html>
@@ -880,6 +907,44 @@ void handleExport() {
   Serial.printf("EXPORT: %lu rows\n", rows);
 }
 
+// GET/POST /clear?pwd=...  — delete ALL history files. Requires the
+// CLEAR_PASSWORD. Also resets the in-RAM min/max tracking.
+void handleClear() {
+  if (!server.hasArg("pwd") || server.arg("pwd") != String(CLEAR_PASSWORD)) {
+    server.send(403, "application/json; charset=utf-8",
+                "{\"ok\":false,\"msg\":\"wrong password\"}");
+    return;
+  }
+
+  int deleted = 0;
+  File root = LittleFS.open(LOG_DIR);
+  if (root && root.isDirectory()) {
+    File f = root.openNextFile();
+    while (f) {
+      String path = String(f.path());
+      f.close();
+      LittleFS.remove(path);
+      deleted++;
+      f = root.openNextFile();
+    }
+    root.close();
+  }
+
+  // Reset min/max tracking so the dashboard starts fresh too.
+  data.temp_min = 999.0f;  data.temp_max = -999.0f;
+  data.hum_min  = 999.0f;  data.hum_max  = -999.0f;
+  data.eco2_min = 65535;   data.eco2_max = 0;
+  data.tvoc_min = 65535;   data.tvoc_max = 0;
+  data.temp_min_time = data.temp_max_time = 0;
+  data.hum_min_time  = data.hum_max_time  = 0;
+  data.eco2_min_time = data.eco2_max_time = 0;
+  data.tvoc_min_time = data.tvoc_max_time = 0;
+
+  String json = "{\"ok\":true,\"deleted\":" + String(deleted) + "}";
+  server.send(200, "application/json; charset=utf-8", json);
+  Serial.printf("CLEAR: deleted %d files\n", deleted);
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  SENSOR HELPERS
 // ═══════════════════════════════════════════════════════════════════
@@ -1149,6 +1214,7 @@ void setup() {
   server.on("/ip",      handleIP);
   server.on("/history", handleHistory);
   server.on("/export",  handleExport);
+  server.on("/clear",   handleClear);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("Web server started");

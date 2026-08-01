@@ -48,6 +48,10 @@ I²C 地址:ENS160 = `0x53`、AHT21 = `0x38`、SSD1306 = `0x3C`。
 - 历史曲线弹窗内「⬇ 导出该区间」:只导出当前选择的范围(24H/7D/30D)。
 - CSV 格式:`timestamp_iso,timestamp_unix,eco2_ppm,tvoc_ppb,temp_c,hum_pct`
 
+### 清除历史(需密码)
+- 仪表盘底部「🗑 清除历史」按钮,输入密码 `1234` 后删除全部历史记录,并重置 min/max 统计。
+- 密码在固件中定义为明文(`CLEAR_PASSWORD` 宏),仅用于防止误操作,不是安全机制。
+
 ### HTTP 接口
 
 | 路径 | 说明 |
@@ -57,6 +61,7 @@ I²C 地址:ENS160 = `0x53`、AHT21 = `0x38`、SSD1306 = `0x3C`。
 | `/ip` | 返回 IP |
 | `/history?metric={eco2\|tvoc\|temp\|hum}&days={1..30}` | 历史曲线数据(自动降采样) |
 | `/export?days={1..30}` | 下载 CSV(默认全部) |
+| `/clear?pwd={密码}` | 清除全部历史记录(需密码,默认 `1234`) |
 
 ---
 
@@ -95,6 +100,7 @@ I²C 地址:ENS160 = `0x53`、AHT21 = `0x38`、SSD1306 = `0x3C`。
 - 30 天数据约 **506 KB**(12 B/分钟),数据分区 1.875 MB,余量充足;如需更久可调大 `LOG_RETENTION_DAYS`。
 - `/export` 与 `/history` 大范围查询是**同步阻塞**的:导出 30 天全量时仪表盘会短暂停顿几秒,属正常。
 - **`config.h` 已被 .gitignore 忽略**,不要提交 WiFi 密码到仓库。
+- **清除密码 `1234` 以明文存在固件中**,仅供局域网内防止误操作;不要当作真正的安全防护。
 - `platformio.ini` 为旧文件,本项目按 **Arduino IDE** 工程维护(PlatformIO 的依赖声明与 `src/` 布局未同步)。
 
 ---
