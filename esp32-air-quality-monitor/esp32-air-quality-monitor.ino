@@ -165,6 +165,19 @@ struct {
   bool     display_on  = true;    // TFT on/off (web toggle; panel sleep + backlight)
   bool     alert       = false;   // threshold alert active
   char     alert_msg[40] = "";    // e.g. "eCO₂ 1250/1000 ppm"
+  // Last-rendered display state (change detection removes the blink)
+  bool     d_valid   = false;     // false → force a full render next time
+  char     d_date[16] = "";
+  int      d_aqi     = -1;
+  char     d_aqi_lbl[16] = "";
+  char     d_e2[12], d_e2n[12], d_e2x[12];   // eco2 value/min/max
+  char     d_tv[12], d_tvn[12], d_tvx[12];   // tvoc
+  char     d_tp[12], d_tpn[12], d_tpx[12];   // temperature
+  char     d_hm[12], d_hmn[12], d_hmx[12];   // humidity
+  int      d_pct       = -1;                 // signal %
+  int      d_wifi_state = -1;                // 0 off / 1 connected / 2 cfg
+  char     d_ssid[33]  = "";
+  char     d_ip[16]    = "";
 } data;
 
 // TFT on/off control — implemented in the DISPLAY section below.
@@ -1644,16 +1657,26 @@ void tftMetricCardFrame(int16_t x, int16_t y, const char *label) {
   tft.print(label);
 }
 
-// Refresh the dynamic text of one card (value/unit + L-min H-max).
-// Background-fill text + clear-rects avoid leftovers and flicker.
+// Refresh the dynamic text of one card (value/unit + L-min H-max), but only
+// when the content actually changed (force=true on first render / after wake).
+// Text is drawn with an opaque background; a region is cleared only when the
+// new text is shorter than the old — so steady same-length updates replace
+// glyphs in place instead of blanking the card (that blanking was the blink).
 void tftMetricCardValues(int16_t x, int16_t y, const char *unit,
-                         const char *value, const char *mn, const char *mx) {
+                         const char *value, const char *mn, const char *mx,
+                         bool force, char *cV, char *cN, char *cX) {
   const uint16_t CARD  = rgb565(22, 24, 38);
   const uint16_t LABEL = rgb565(140, 148, 168);
   const uint16_t MINC  = rgb565(120, 190, 240);
   const uint16_t MAXC  = rgb565(255, 150, 120);
 
-  tft.fillRect(x + 6, y + 16, 100, 28, CARD);
+  if (!force && strcmp(cV, value) == 0 &&
+                strcmp(cN, mn)    == 0 &&
+                strcmp(cX, mx)    == 0) return;   // nothing changed
+
+  bool vshrink = force || strlen(value) < strlen(cV);
+  if (vshrink) tft.fillRect(x + 6, y + 16, 100, 28, CARD);
+
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_WHITE, CARD);
   tft.setCursor(x + 8, y + 18);
@@ -1663,7 +1686,8 @@ void tftMetricCardValues(int16_t x, int16_t y, const char *unit,
   tft.setCursor(x + 8 + strlen(value) * 12 + 2, y + 24);
   tft.print(unit);
 
-  tft.fillRect(x + 6, y + 44, 100, 10, CARD);
+  bool nshrink = force || strlen(mn) < strlen(cN) || strlen(mx) < strlen(cX);
+  if (nshrink) tft.fillRect(x + 6, y + 44, 100, 10, CARD);
   tft.setTextSize(1);
   tft.setTextColor(MINC, CARD);
   tft.setCursor(x + 8, y + 46);
@@ -1675,6 +1699,10 @@ void tftMetricCardValues(int16_t x, int16_t y, const char *unit,
   tft.print("H");
   tft.setCursor(x + 66, y + 46);
   tft.print(mx);
+
+  strncpy(cV, value, 11); cV[11] = '\0';
+  strncpy(cN, mn, 11);    cN[11] = '\0';
+  strncpy(cX, mx, 11);    cX[11] = '\0';
 }
 
 // Draw the whole static frame once (background, cards, labels).
@@ -1699,135 +1727,174 @@ void tftDrawLayout() {
   tftMetricCardFrame(CARD_R, 208, "HUM");
 }
 
-// Called every second — only redraws changed text, never clears the whole
-// screen (that full-screen clear was what caused the flicker).
+// Called every second. Change-detection: each region is only redrawn when
+// its content actually changed, and text uses an opaque background so it is
+// replaced in place instead of "clear-then-draw" — that is what caused the
+// visible blink on the panel. Pass force (first render / after wake) to
+// redraw everything.
 void updateDisplay() {
   const uint16_t BG    = ST77XX_BLACK;
   const uint16_t CARD  = rgb565(22, 24, 38);
   const uint16_t LABEL = rgb565(140, 148, 168);
 
+  bool force = !data.d_valid;
+
   // ── Time ─────────────────────────────────────────────────────
-  tft.fillRect(0, 6, TFT_W, 34, BG);
+  // Always 8 chars ("--:--:--" or "HH:MM:SS") → fixed region; opaque-bg
+  // text replaces it cleanly with no full-strip clear.
   tft.setTextSize(4);
   tft.setTextColor(data.alert ? ST77XX_RED : ST77XX_WHITE, BG);
   tft.setCursor((TFT_W - strlen(data.time_str) * 24) / 2, 6);
   tft.print(data.time_str);
 
   // ── Date ─────────────────────────────────────────────────────
-  tft.fillRect(0, 40, TFT_W, 8, BG);
-  tft.setTextSize(1);
-  tft.setTextColor(LABEL, BG);
+  char ds[16] = "";
   if (data.time_synced) {
     time_t t = time(nullptr);
     struct tm *ti = localtime(&t);
-    char ds[16];
     strftime(ds, sizeof(ds), "%Y-%m-%d", ti);
-    tft.setCursor((TFT_W - strlen(ds) * 6) / 2, 40);
-    tft.print(ds);
+  }
+  if (force || strcmp(data.d_date, ds) != 0) {
+    strncpy(data.d_date, ds, sizeof(data.d_date) - 1);
+    data.d_date[sizeof(data.d_date) - 1] = '\0';
+    tft.fillRect(0, 40, TFT_W, 8, BG);
+    if (ds[0]) {
+      tft.setTextSize(1);
+      tft.setTextColor(LABEL, BG);
+      tft.setCursor((TFT_W - strlen(ds) * 6) / 2, 40);
+      tft.print(ds);
+    }
   }
 
   // ── AQI value + label (centred as a group in the banner) ─────
-  tft.fillRect(AQI_X, 74, AQI_W, 34, CARD);
-  if (data.aqi >= 1 && data.aqi <= 5) {
-    uint16_t c = aqiColor(data.aqi);
-    const char *lbl = AQI_LABEL[data.aqi];
-    int total = 24 + (int)strlen(lbl) * 18 + 8;   // digit(size4) + gap + label(size3)
-    int x0 = AQI_X + (AQI_W - total) / 2;
-    tft.setTextSize(4);
-    tft.setTextColor(c, CARD);
-    tft.setCursor(x0, 76);
-    tft.print(data.aqi);
-    tft.setTextSize(3);
-    tft.setCursor(x0 + 32, 82);
-    tft.print(lbl);
-  } else {
-    int x0 = AQI_X + (AQI_W - 48) / 2;   // "--" centred
-    tft.setTextSize(4);
-    tft.setTextColor(LABEL, CARD);
-    tft.setCursor(x0, 76);
-    tft.print("--");
+  const char *lbl = (data.aqi >= 1 && data.aqi <= 5) ? AQI_LABEL[data.aqi] : "";
+  if (force || data.d_aqi != data.aqi || strcmp(data.d_aqi_lbl, lbl) != 0) {
+    data.d_aqi = data.aqi;
+    strncpy(data.d_aqi_lbl, lbl, sizeof(data.d_aqi_lbl) - 1);
+    data.d_aqi_lbl[sizeof(data.d_aqi_lbl) - 1] = '\0';
+    tft.fillRect(AQI_X, 74, AQI_W, 34, CARD);
+    if (data.aqi >= 1 && data.aqi <= 5) {
+      uint16_t c = aqiColor(data.aqi);
+      int total = 24 + (int)strlen(lbl) * 18 + 8;   // digit(size4) + gap + label(size3)
+      int x0 = AQI_X + (AQI_W - total) / 2;
+      tft.setTextSize(4);
+      tft.setTextColor(c, CARD);
+      tft.setCursor(x0, 76);
+      tft.print(data.aqi);
+      tft.setTextSize(3);
+      tft.setCursor(x0 + 32, 82);
+      tft.print(lbl);
+    } else {
+      int x0 = AQI_X + (AQI_W - 48) / 2;   // "--" centred
+      tft.setTextSize(4);
+      tft.setTextColor(LABEL, CARD);
+      tft.setCursor(x0, 76);
+      tft.print("--");
+    }
   }
 
-  // ── metric values + min/max ──────────────────────────────────
+  // ── metric values + min/max (change-detected) ──────────────────
   char b[12], mn[12], mx[12];
 
   if (data.ens160_ok) snprintf(b, sizeof(b), "%u", data.eco2); else strcpy(b, "--");
   snprintf(mn, sizeof(mn), "%u", data.eco2_min);
   snprintf(mx, sizeof(mx), "%u", data.eco2_max);
-  tftMetricCardValues(CARD_L, 132, "ppm", b, mn, mx);
+  tftMetricCardValues(CARD_L, 132, "ppm", b, mn, mx, force, data.d_e2, data.d_e2n, data.d_e2x);
 
   if (data.ens160_ok) snprintf(b, sizeof(b), "%u", data.tvoc); else strcpy(b, "--");
   snprintf(mn, sizeof(mn), "%u", data.tvoc_min);
   snprintf(mx, sizeof(mx), "%u", data.tvoc_max);
-  tftMetricCardValues(CARD_R, 132, "ppb", b, mn, mx);
+  tftMetricCardValues(CARD_R, 132, "ppb", b, mn, mx, force, data.d_tv, data.d_tvn, data.d_tvx);
 
   if (data.aht_ok) snprintf(b, sizeof(b), "%.1f", data.temperature); else strcpy(b, "--");
   snprintf(mn, sizeof(mn), data.temp_min > 990 ? "--" : "%.1f", data.temp_min);
   snprintf(mx, sizeof(mx), data.temp_max < -990 ? "--" : "%.1f", data.temp_max);
-  tftMetricCardValues(CARD_L, 208, "C", b, mn, mx);
+  tftMetricCardValues(CARD_L, 208, "C", b, mn, mx, force, data.d_tp, data.d_tpn, data.d_tpx);
 
   if (data.aht_ok) snprintf(b, sizeof(b), "%.0f", data.humidity); else strcpy(b, "--");
   snprintf(mn, sizeof(mn), data.hum_min > 990 ? "--" : "%.0f", data.hum_min);
   snprintf(mx, sizeof(mx), data.hum_max < -990 ? "--" : "%.0f", data.hum_max);
-  tftMetricCardValues(CARD_R, 208, "%", b, mn, mx);
+  tftMetricCardValues(CARD_R, 208, "%", b, mn, mx, force, data.d_hm, data.d_hmn, data.d_hmx);
 
-  // ── Bottom area: SSID (line above), IP (centre), % (left), icon (right) ─
-  tft.fillRect(0, 272, TFT_W, 36, BG);
+  // ── Bottom area (whole strip redrawn only when its state/content changes)
   tft.setTextSize(1);
-  if (WiFi.status() == WL_CONNECTED) {
+  int mode = (WiFi.status() == WL_CONNECTED) ? 1 : (cfg_mode ? 2 : 0);
+  bool bottom_changed = force || data.d_wifi_state != mode;
+  data.d_wifi_state = mode;
+
+  if (mode == 1) {
     int rssi = WiFi.RSSI();
     int pct  = constrain(map(rssi, -90, -35, 0, 100), 0, 100);
-    uint16_t c = wifiColor(pct);
-
-    // RSSI in dBm (bottom-left, on the SSID row above the %)
-    char rssibuf[12];
-    snprintf(rssibuf, sizeof(rssibuf), "%ddBm", rssi);
-    tft.setTextColor(c, BG);
-    tft.setCursor(4, 278);
-    tft.print(rssibuf);
-
-    // SSID (centred, above the bottom row)
-    tft.setTextColor(ST77XX_GREEN, BG);
     String ssid = WiFi.SSID();
-    tft.setCursor((TFT_W - ssid.length() * 6) / 2, 278);
-    tft.print(ssid);
+    String ip   = WiFi.localIP().toString();
+    bottom_changed = bottom_changed || data.d_pct != pct ||
+                     strcmp(data.d_ssid, ssid.c_str()) != 0 ||
+                     strcmp(data.d_ip, ip.c_str()) != 0;
+    if (bottom_changed) {
+      data.d_pct = pct;
+      strncpy(data.d_ssid, ssid.c_str(), sizeof(data.d_ssid) - 1);
+      data.d_ssid[sizeof(data.d_ssid) - 1] = '\0';
+      strncpy(data.d_ip, ip.c_str(), sizeof(data.d_ip) - 1);
+      data.d_ip[sizeof(data.d_ip) - 1] = '\0';
+      uint16_t c = wifiColor(pct);
+      tft.fillRect(0, 272, TFT_W, 36, BG);
 
-    // IP (centred)
-    tft.setTextColor(ST77XX_GREEN, BG);
-    String ip = WiFi.localIP().toString();
-    tft.setCursor((TFT_W - ip.length() * 6) / 2, 296);
-    tft.print(ip);
+      // RSSI in dBm (bottom-left, on the SSID row above the %)
+      char rssibuf[12];
+      snprintf(rssibuf, sizeof(rssibuf), "%ddBm", rssi);
+      tft.setTextColor(c, BG);
+      tft.setCursor(4, 278);
+      tft.print(rssibuf);
 
-    // signal % (bottom-left)
-    tft.setTextColor(c, BG);
-    tft.setCursor(4, 296);
-    tft.print(pct);
-    tft.print("%");
+      // SSID (centred, above the bottom row)
+      tft.setTextColor(ST77XX_GREEN, BG);
+      tft.setCursor((TFT_W - ssid.length() * 6) / 2, 278);
+      tft.print(ssid);
 
-    // WiFi icon (bottom-right)
-    tftDrawWifiIcon(TFT_W - 16, 302, pct, c);
-  } else if (cfg_mode) {
-    // AP config hotspot — the device is reachable at 192.168.4.1
-    tft.setTextColor(ST77XX_GREEN, BG);
-    String ap = String("Config: ") + CFG_AP_SSID;
-    tft.setCursor((TFT_W - ap.length() * 6) / 2, 278);
-    tft.print(ap);
-    String aip = WiFi.softAPIP().toString();
-    tft.setCursor((TFT_W - aip.length() * 6) / 2, 296);
-    tft.print(aip);
-    tftDrawWifiIcon(TFT_W - 16, 302, 40, ST77XX_YELLOW);
+      // IP (centred)
+      tft.setTextColor(ST77XX_GREEN, BG);
+      tft.setCursor((TFT_W - ip.length() * 6) / 2, 296);
+      tft.print(ip);
+
+      // signal % (bottom-left)
+      tft.setTextColor(c, BG);
+      tft.setCursor(4, 296);
+      tft.print(pct);
+      tft.print("%");
+
+      // WiFi icon (bottom-right)
+      tftDrawWifiIcon(TFT_W - 16, 302, pct, c);
+    }
+  } else if (mode == 2) {
+    if (bottom_changed) {
+      tft.fillRect(0, 272, TFT_W, 36, BG);
+      // AP config hotspot — the device is reachable at 192.168.4.1
+      tft.setTextColor(ST77XX_GREEN, BG);
+      String ap = String("Config: ") + CFG_AP_SSID;
+      tft.setCursor((TFT_W - ap.length() * 6) / 2, 278);
+      tft.print(ap);
+      String aip = WiFi.softAPIP().toString();
+      tft.setCursor((TFT_W - aip.length() * 6) / 2, 296);
+      tft.print(aip);
+      tftDrawWifiIcon(TFT_W - 16, 302, 40, ST77XX_YELLOW);
+    }
   } else {
-    const char *ns = "WiFi: no connection";
-    tft.setTextColor(ST77XX_GREEN, BG);
-    tft.setCursor((TFT_W - strlen(ns) * 6) / 2, 296);
-    tft.print(ns);
+    if (bottom_changed) {
+      tft.fillRect(0, 272, TFT_W, 36, BG);
+      const char *ns = "WiFi: no connection";
+      tft.setTextColor(ST77XX_GREEN, BG);
+      tft.setCursor((TFT_W - strlen(ns) * 6) / 2, 296);
+      tft.print(ns);
 
-    tft.setTextColor(rgb565(140, 148, 168), BG);
-    tft.setCursor(4, 296);
-    tft.print("--%");
+      tft.setTextColor(rgb565(140, 148, 168), BG);
+      tft.setCursor(4, 296);
+      tft.print("--%");
 
-    tftDrawWifiIcon(TFT_W - 16, 302, -1, rgb565(70, 74, 90));
+      tftDrawWifiIcon(TFT_W - 16, 302, -1, rgb565(70, 74, 90));
+    }
   }
+
+  data.d_valid = true;
 }
 
 // Turn the TFT panel + backlight on/off from the web dashboard.
@@ -1842,6 +1909,7 @@ void setDisplay(bool on) {
     tft.enableDisplay(true);     // ST77XX_DISPON
     delay(20);
     tftDrawLayout();
+    data.d_valid = false;        // force a full redraw after wake
     updateDisplay();
   } else {
     // Sleep sequence per datasheet: Display OFF first, then Sleep In.
