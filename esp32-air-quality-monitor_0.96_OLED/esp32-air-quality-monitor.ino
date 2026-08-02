@@ -3,49 +3,38 @@
  * ─────────────────────────────
  * Sensors:  ENS160 (VOC / eCO₂ / AQI)
  *            AHT21 (temperature / humidity)
- * Display:  ST7789 TFT 240×320 (SPI)
+ * Display:  SSD1306 OLED 128×64 (I²C)
  * Network:  WiFi + built-in WebServer (NO external libraries needed)
  *
- * Wiring — sensors on I²C bus (share SDA/SCL):
+ * Wiring (I²C bus — all three devices share the same SDA/SCL):
  *
- *   ESP32-C3 | ENS160 | AHT21
- *   ─────────┼────────┼───────
- *   3V3      │ VIN    │ VIN
- *   GND      │ GND    │ GND
- *   GPIO 4   │ SDA    │ SDA
- *   GPIO 5   │ SCL    │ SCL
+ *   ESP32-C3 | ENS160 | AHT21 | SSD1306
+ *   ─────────┼────────┼───────┼────────
+ *   3V3      │ VIN    │ VIN   │ VCC
+ *   GND      │ GND    │ GND   │ GND
+ *   GPIO 4   │ SDA    │ SDA   │ SDA
+ *   GPIO 5   │ SCL    │ SCL   │ SCL
  *
- * Wiring — ST7789 TFT on SPI (board silkscreen: BL CS DC RST SDA SCL VCC GND):
- *   (note: on this module "SDA" = SPI MOSI/DIN, "SCL" = SPI SCLK/CLK)
- *
- *   ESP32-C3 | ST7789 TFT
- *   ─────────┼─────────
- *   3V3      │ VCC
- *   GND      │ GND
- *   GPIO 8   │ SCL  (SCLK/CLK)
- *   GPIO 6   │ SDA  (MOSI/DIN)
- *   GPIO 10  │ CS
- *   GPIO 7   │ DC
- *   GPIO 9   │ RST
- *   GPIO 3   │ BL   (or tie BL to 3V3 and set TFT_BL to -1)
- *
- *   I²C addresses:  ENS160 = 0x53,   AHT21 = 0x38
+ *   I²C addresses:  ENS160 = 0x53
+ *                   AHT21  = 0x38
+ *                   SSD1306 = 0x3C
  *
  * ─── Board pin notes ────────────────
- *   Wiring above is for Seeed XIAO ESP32-C3.
- *   Other boards use different GPIOs — change TFT_* and I2C_* to match.
+ *   Seeed XIAO C3:       SDA=4,  SCL=5   (selected below)
+ *   ESP32-C3-DevKitM-1:  SDA=8,  SCL=9
+ *   AirM2M C3:           SDA=6,  SCL=7
+ *   Lolin C3 Mini:       SDA=8,  SCL=9
+ *
+ *   Change I2C_SDA / I2C_SCL below to match your board.
  */
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
+#include <Adafruit_SSD1306.h>
 #include <Adafruit_AHTX0.h>
 #include <ScioSense_ENS160.h>
-#include <SPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <DNSServer.h>    // captive-portal DNS for the AP config hotspot
-#include <ESPmDNS.h>      // advertise <device>.local so scanners see a friendly name
 #include <time.h>
 #include <LittleFS.h>
 #include <math.h>
@@ -58,24 +47,10 @@
 #define I2C_SDA   4
 #define I2C_SCL   5
 
-// --- TFT (ST7789 2.0" 240×320, SPI) --------------------------------
-#define TFT_SCLK  8
-#define TFT_MOSI  6
-#define TFT_CS   10
-#define TFT_DC    7
-#define TFT_RST   9
-#define TFT_BL    3    // -1 if the module ties backlight to 3V3
-#define TFT_W   240
-#define TFT_H   320
-#define TFT_SELFTEST  1  // 1 = flash red/green/blue at boot to verify SPI path
-
-// --- Card layout (perfectly centred) --------------------------------
-// 2×2 metric cards: 112px each + 2px gap = 226px → 7px side margins.
-#define CARD_L   7        // left  column x
-#define CARD_R   121      // right column x (= 7 + 112 + 2)
-// AQI banner (first row): centred, 2px wider than the old 220px.
-#define AQI_X    9
-#define AQI_W    (TFT_W - 18)   // 222
+// --- OLED ----------------------------------------------------------
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR     0x3C
 
 // --- WiFi (set credentials in config.h) ----------------------------
 #include "config.h"
@@ -84,49 +59,25 @@
 #define READ_INTERVAL_MS  1000   // slow tasks (AHT21, time, display): every 1 s
 #define ENS160_POLL_MS    200    // ENS160 non-blocking poll (~5×/s; new data ~1×/s)
 
+// --- NTP time --------------------------------------------------------
+#define TZ_OFFSET_SEC  (8 * 3600)   // UTC+8 (China) — change for your zone
+#define NTP_SERVER1    "ntp2.aliyun.com"
+#define NTP_SERVER2    "ntp3.aliyun.com"
+
 // --- Data logging (LittleFS; requires "No OTA (2MB APP/2MB SPIFFS)" ---
 // --- partition scheme in Arduino IDE) --------------------------------
 #define LOG_DIR            "/log"
+#define LOG_INTERVAL_S     60           // append a record every minute
+#define LOG_RETENTION_DAYS 30           // keep the last N days (ring buffer)
 #define HISTORY_MAX_BINS   1200         // max curve points returned by /history
-
-// --- Runtime settings ---------------------------------------------------
-// Stored in LittleFS /cfg.txt (see loadSettings/saveSettings). The
-// WIFI_SSID / WIFI_PASSWORD macros from config.h act as factory defaults.
-#define CFG_FILE            "/cfg.txt"
-#define CFG_AP_SSID         "AirQuality-Config"
-#define NTP_SERVER_DEFAULT  "ntp2.aliyun.com"
-#define NTP_SERVER_FALLBACK "ntp3.aliyun.com"
-#define MAX_RETENTION_DAYS  60          // hard cap for the export file array
-
-struct Settings {
-  char     wifi_ssid[33];
-  char     wifi_pass[65];
-  char     device_name[33];            // DHCP/mDNS hostname (scanner-friendly)
-  char     clear_pwd[17];              // password for /clear
-  char     ntp_server[65];
-  int32_t  tz_sec;                     // timezone offset, seconds
-  uint16_t log_interval_s;             // seconds between log records
-  uint16_t log_retention_days;         // ring-buffer retention (calendar days)
-  bool     alert_enabled;
-  uint16_t alert_eco2;                 // ppm
-  uint16_t alert_tvoc;                 // ppb
-  uint8_t  alert_aqi;                  // 1..5
-};
-
-Settings cfg;
-bool cfg_mode = false;   // true when WiFi failed → AP config hotspot is running
-
-void setDefaults();
-void loadSettings();
-void saveSettings();
-void reinitNTP();
+#define CLEAR_PASSWORD     "1234"       // password required to clear history (plaintext)
 
 // ═══════════════════════════════════════════════════════════════════
 //  GLOBALS
 // ═══════════════════════════════════════════════════════════════════
 
-// Display (ST7789 240×320 over SPI)
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+// Display
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // Sensors
 Adafruit_AHTX0    aht;
@@ -134,7 +85,6 @@ ScioSense_ENS160  ens160(ENS160_I2CADDR_1);   // 0x53
 
 // Web server (built-in — no external libraries needed)
 WebServer server(80);
-DNSServer dns;                       // captive-portal DNS (AP config mode only)
 
 // Shared sensor snapshot (updated every READ_INTERVAL_MS)
 struct {
@@ -162,13 +112,7 @@ struct {
   // Current time string (updated every read cycle)
   char     time_str[9] = "--:--:--";
   bool     time_synced = false;
-  bool     display_on  = true;    // TFT on/off (web toggle; panel sleep + backlight)
-  bool     alert       = false;   // threshold alert active
-  char     alert_msg[40] = "";    // e.g. "eCO₂ 1250/1000 ppm"
 } data;
-
-// TFT on/off control — implemented in the DISPLAY section below.
-void setDisplay(bool on);
 
 // ═══════════════════════════════════════════════════════════════════
 //  HTML / CSS / JS  (embedded — served as the web dashboard)
@@ -280,13 +224,6 @@ const char index_html[] PROGMEM = R"rawliteral(
   .export-btn.danger { border-color: rgba(255,82,82,.45); color: #ff8a8a; }
   .export-btn.danger:hover { background: rgba(255,82,82,.12); }
   .action-row { display: flex; justify-content: center; gap: 12px; }
-  .alert-banner {
-    display: none; align-items: center; justify-content: center; gap: 8px;
-    background: rgba(255,23,68,.12); border: 1px solid rgba(255,23,68,.45);
-    color: #ff8a8a; border-radius: 14px; padding: 10px 14px;
-    font-size: 14px; font-weight: 600; text-align: center;
-  }
-  .alert-banner.show { display: flex; }
 </style>
 </head>
 <body>
@@ -325,9 +262,6 @@ const char index_html[] PROGMEM = R"rawliteral(
     </div>
   </div>
 
-  <!-- Threshold alert banner (hidden unless active) -->
-  <div class="alert-banner" id="alert-banner"><span>⚠</span><span id="alert-text"></span></div>
-
   <!-- History chart modal -->
   <div class="modal-overlay" id="modal" onclick="if(event.target===this)closeHistory()">
     <div class="modal">
@@ -353,9 +287,7 @@ const char index_html[] PROGMEM = R"rawliteral(
   </div>
   <div class="action-row">
     <a class="export-btn" href="/export" download="aq_log.csv">⬇ 导出 CSV</a>
-    <button class="export-btn" id="display-btn" onclick="toggleDisplay()">⏻ 关闭屏幕</button>
     <button class="export-btn danger" onclick="clearHistory()">🗑 清除历史</button>
-    <a class="export-btn" href="/config">⚙ 设置</a>
   </div>
 </div>
 
@@ -402,43 +334,9 @@ const char index_html[] PROGMEM = R"rawliteral(
     document.getElementById('tvoc-min-t').textContent = d.tvoc_min_time;
     document.getElementById('tvoc-max-t').textContent = d.tvoc_max_time;
     document.getElementById('status-text').textContent = 'Connected';
-
-    // Reflect TFT on/off on the display toggle button.
-    displayState = (d.display === 1);
-    updateDisplayBtn();
-
-    // Threshold alert banner.
-    const ab = document.getElementById('alert-banner');
-    if (d.alert) {
-      ab.classList.add('show');
-      document.getElementById('alert-text').textContent = '告警: ' + (d.alert_msg || '超出阈值');
-    } else {
-      ab.classList.remove('show');
-    }
   }
 
-  // ── TFT display on/off (web toggle) ──────────────────────────────
-  function updateDisplayBtn() {
-    const btn = document.getElementById('display-btn');
-    if (!btn) return;
-    if (displayState) {
-      btn.textContent = '⏻ 关闭屏幕';
-      btn.classList.remove('danger');
-    } else {
-      btn.textContent = '⏻ 开启屏幕';
-      btn.classList.add('danger');
-    }
-  }
-  async function toggleDisplay() {
-    const want = displayState ? 'off' : 'on';
-    try {
-      const r = await fetch('/display?state=' + want, { method: 'POST' });
-      const d = await r.json();
-      if (d.ok) { displayState = d.display === 'on'; updateDisplayBtn(); }
-    } catch (e) { console.warn('display error:', e); }
-  }
-
-  // Poll /data every 1 second — simple, reliable, no WebSocket needed
+  // Poll /data every 2 seconds — simple, reliable, no WebSocket needed
   async function poll() {
     try {
       const r = await fetch('/data');
@@ -470,7 +368,6 @@ const char index_html[] PROGMEM = R"rawliteral(
   let chartMetric = 'temp';
   let chartDays   = 1;
   let chartData   = null;
-  let displayState = true;   // TFT on/off, synced from /data
 
   const modal  = document.getElementById('modal');
   const canvas = document.getElementById('chart-canvas');
@@ -510,28 +407,6 @@ const char index_html[] PROGMEM = R"rawliteral(
     return mode === '24h'
       ? pad2(d.getHours()) + ':' + pad2(d.getMinutes())
       : pad2(d.getMonth() + 1) + '/' + pad2(d.getDate()) + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
-  }
-
-  // Light centered moving average (±2 neighbours) so short-term sensor
-  // noise doesn't make the curve jagged. Neighbours are only averaged when
-  // they are close in time, so real data gaps are never bridged.
-  function smoothPts(pts) {
-    const n = pts.length;
-    if (n < 3) return pts.map(p => p.slice());
-    const spac = [];
-    for (let i = 1; i < n; i++) spac.push(pts[i][0] - pts[i - 1][0]);
-    spac.sort((a, b) => a - b);
-    const med = spac[Math.floor(spac.length / 2)] || 60;
-    const maxSpan = Math.max(med * 5, 120);
-    const out = pts.map(p => p.slice());
-    for (let i = 0; i < n; i++) {
-      let s = 0, c = 0;
-      for (let j = Math.max(0, i - 2); j <= Math.min(n - 1, i + 2); j++) {
-        if (Math.abs(pts[j][0] - pts[i][0]) <= maxSpan) { s += pts[j][1]; c++; }
-      }
-      if (c) out[i][1] = s / c;
-    }
-    return out;
   }
 
   function getScale(pts, pad) {
@@ -575,35 +450,18 @@ const char index_html[] PROGMEM = R"rawliteral(
       cctx.fillText(fmtT(Math.round(t), mode), sc.X(t), PAD.t + sc.ph + 6);
     }
 
-    // Smooth curve through the points (Catmull-Rom spline as cubic Bézier).
-    cctx.lineJoin = 'round'; cctx.lineCap = 'round';
-    cctx.strokeStyle = M.color; cctx.lineWidth = 2;
     cctx.beginPath();
-    cctx.moveTo(sc.X(pts[0][0]), sc.Y(pts[0][1]));
-    for (let i = 0; i < pts.length - 1; i++) {
-      const p0 = pts[Math.max(0, i - 1)];
-      const p1 = pts[i];
-      const p2 = pts[i + 1];
-      const p3 = pts[Math.min(pts.length - 1, i + 2)];
-      cctx.bezierCurveTo(
-        sc.X(p1[0]) + (sc.X(p2[0]) - sc.X(p0[0])) / 6,
-        sc.Y(p1[1]) + (sc.Y(p2[1]) - sc.Y(p0[1])) / 6,
-        sc.X(p2[0]) - (sc.X(p3[0]) - sc.X(p1[0])) / 6,
-        sc.Y(p2[1]) - (sc.Y(p3[1]) - sc.Y(p1[1])) / 6,
-        sc.X(p2[0]), sc.Y(p2[1]));
-    }
+    pts.forEach((p, i) => i ? cctx.lineTo(sc.X(p[0]), sc.Y(p[1])) : cctx.moveTo(sc.X(p[0]), sc.Y(p[1])));
+    cctx.strokeStyle = M.color; cctx.lineWidth = 2;
+    cctx.lineJoin = 'round'; cctx.lineCap = 'round';
     cctx.stroke();
-    // Area fill follows the same curve down to the baseline.
-    cctx.lineTo(sc.X(pts[pts.length - 1][0]), sc.Y(sc.lo));
-    cctx.lineTo(sc.X(pts[0][0]), sc.Y(sc.lo));
-    cctx.closePath();
+    cctx.lineTo(sc.X(sc.t1), sc.Y(sc.lo)); cctx.lineTo(sc.X(sc.t0), sc.Y(sc.lo)); cctx.closePath();
     cctx.fillStyle = M.color; cctx.globalAlpha = .12; cctx.fill(); cctx.globalAlpha = 1;
   }
 
   function renderChart() {
     const M = METRICS[chartMetric];
-    const raw = (chartData && chartData.points) ? chartData.points : [];
-    const pts = raw.length ? smoothPts(raw) : [];   // smoothed for display
+    const pts = (chartData && chartData.points) ? chartData.points : [];
     const stats = document.getElementById('chart-stats');
     if (!pts.length) {
       cctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
@@ -664,112 +522,6 @@ const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// Configuration page (dark theme, same look as the dashboard).
-const char config_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>设置 · Air Quality Monitor</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-         background: #0f0f1a; color: #e0e0e0; min-height: 100vh; padding: 24px 16px; }
-  .wrap { max-width: 480px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
-  h1 { font-size: 20px; font-weight: 700; text-align: center; }
-  .card { background: #1a1a2e; border-radius: 20px; padding: 20px; box-shadow: 0 4px 20px rgba(0,0,0,.3); }
-  .sec { font-size: 12px; text-transform: uppercase; letter-spacing: 2px; opacity: .5; margin: 16px 0 10px; }
-  .sec:first-child { margin-top: 0; }
-  .row { display: flex; flex-direction: column; gap: 4px; margin-bottom: 14px; }
-  .row label { font-size: 13px; opacity: .75; }
-  .row input { background: #14142b; border: 1px solid #2c2c4a; color: #e0e0e0;
-               border-radius: 10px; padding: 10px 12px; font-size: 15px; outline: none; }
-  .row input:focus { border-color: #4FC3F7; }
-  .row .hint { font-size: 11px; opacity: .45; }
-  .chk { flex-direction: row; align-items: center; gap: 10px; }
-  .chk input { width: 20px; height: 20px; accent-color: #4FC3F7; }
-  .btn { background: #4FC3F7; color: #0a0a14; border: none; border-radius: 999px;
-         padding: 14px; font-size: 16px; font-weight: 700; cursor: pointer; width: 100%; }
-  .btn:active { transform: scale(.98); }
-  #msg { text-align: center; font-size: 14px; min-height: 20px; }
-  #msg.ok { color: #00E676; } #msg.err { color: #ff8a8a; }
-  .back { text-align: center; font-size: 13px; opacity: .5; text-decoration: none; color: #80DEEA; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>⚙ 设备设置</h1>
-  <form class="card" id="cfg">
-    <div class="sec">WiFi</div>
-    <div class="row"><label>SSID</label><input name="wifi_ssid" id="wifi_ssid" autocomplete="off" required></div>
-    <div class="row"><label>密码</label><input name="wifi_pass" id="wifi_pass" type="password" autocomplete="off" placeholder="留空则保持当前密码">
-      <span class="hint">留空 = 不修改当前 WiFi 密码</span></div>
-    <div class="sec">系统</div>
-    <div class="row"><label>设备名称</label><input name="device_name" id="device_name" maxlength="32">
-      <span class="hint">字母/数字/中划线;用于 IP 扫描工具、路由器设备列表、mDNS(&lt;名称&gt;.local)</span></div>
-    <div class="row"><label>清除历史密码</label><input name="clear_pwd" id="clear_pwd" autocomplete="off"></div>
-    <div class="row"><label>NTP 服务器</label><input name="ntp_server" id="ntp_server"></div>
-    <div class="row"><label>时区(UTC 偏移,小时)</label><input name="tz_hours" id="tz_hours" type="number" step="0.5" min="-14" max="14"></div>
-    <div class="row"><label>日志记录间隔(秒)</label><input name="log_interval_s" id="log_interval_s" type="number" min="5" max="3600"></div>
-    <div class="row"><label>日志保留天数</label><input name="log_retention_days" id="log_retention_days" type="number" min="1" max="60"></div>
-    <div class="sec">告警阈值</div>
-    <div class="row chk"><label>启用告警</label><input name="alert_enabled" id="alert_enabled" type="checkbox"></div>
-    <div class="row"><label>eCO₂ 阈值(ppm)</label><input name="alert_eco2" id="alert_eco2" type="number" min="0"></div>
-    <div class="row"><label>TVOC 阈值(ppb)</label><input name="alert_tvoc" id="alert_tvoc" type="number" min="0"></div>
-    <div class="row"><label>AQI 阈值(1-5)</label><input name="alert_aqi" id="alert_aqi" type="number" min="1" max="5"></div>
-    <button class="btn" type="submit">保存</button>
-  </form>
-  <div id="msg"></div>
-  <a class="back" href="/">← 返回仪表盘</a>
-</div>
-<script>
-  const msgEl = document.getElementById('msg');
-  function msg(t, c) { msgEl.textContent = t; msgEl.className = c || ''; }
-
-  async function loadCfg() {
-    try {
-      const d = await (await fetch('/config/data')).json();
-      document.getElementById('wifi_ssid').value = d.wifi_ssid || '';
-      document.getElementById('device_name').value = d.device_name || '';
-      document.getElementById('clear_pwd').value = d.clear_pwd || '';
-      document.getElementById('ntp_server').value = d.ntp_server || '';
-      document.getElementById('tz_hours').value = d.tz_hours;
-      document.getElementById('log_interval_s').value = d.log_interval_s;
-      document.getElementById('log_retention_days').value = d.log_retention_days;
-      document.getElementById('alert_enabled').checked = !!d.alert_enabled;
-      document.getElementById('alert_eco2').value = d.alert_eco2;
-      document.getElementById('alert_tvoc').value = d.alert_tvoc;
-      document.getElementById('alert_aqi').value = d.alert_aqi;
-    } catch (e) { msg('加载配置失败: ' + e, 'err'); }
-  }
-
-  document.getElementById('cfg').addEventListener('submit', async e => {
-    e.preventDefault();
-    // URL-encoded body (the ESP32 WebServer only parses this into args).
-    const params = new URLSearchParams(new FormData(e.target));
-    if (document.getElementById('wifi_pass').value.trim() === '') params.delete('wifi_pass');
-    try {
-      const r = await fetch('/config/save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: params.toString(),
-      });
-      const d = await r.json();
-      if (d.ok) {
-        msg(d.reboot ? '已保存,设备正在重启…' : '已保存', 'ok');
-      } else {
-        msg(d.msg || '保存失败', 'err');
-      }
-    } catch (e) { msg('保存失败: ' + e, 'err'); }
-  });
-
-  loadCfg();
-</script>
-</body>
-</html>
-)rawliteral";
-
 // ═══════════════════════════════════════════════════════════════════
 //  HTTP HANDLERS
 // ═══════════════════════════════════════════════════════════════════
@@ -788,10 +540,7 @@ void handleRoot() {
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Expires", "0");
-  // In AP config mode, the root path serves the settings page so a phone
-  // that connects to the hotspot (or its captive-portal probe) lands
-  // straight on the reconfiguration form.
-  server.send_P(200, "text/html", cfg_mode ? config_html : index_html);
+  server.send_P(200, "text/html", index_html);
 }
 
 void handleData() {
@@ -837,12 +586,6 @@ void handleData() {
   json += fmtTime(data.hum_min_time);
   json += "\",\"hum_max_time\":\"";
   json += fmtTime(data.hum_max_time);
-  json += "\",\"display\":";
-  json += data.display_on ? "1" : "0";
-  json += ",\"alert\":";
-  json += data.alert ? "1" : "0";
-  json += ",\"alert_msg\":\"";
-  json += String(data.alert_msg);
   json += "\",\"time\":\"";
   json += String(data.time_str);
   json += "\"}";
@@ -850,170 +593,11 @@ void handleData() {
 }
 
 void handleIP() {
-  if (cfg_mode) server.send(200, "text/plain", WiFi.softAPIP().toString());
-  else          server.send(200, "text/plain", WiFi.localIP().toString());
+  server.send(200, "text/plain", WiFi.localIP().toString());
 }
 
 void handleNotFound() {
-  // Unknown paths → redirect. In AP config mode this makes OS captive-
-  // portal probes (connectivitycheck / generate_204 …) land on the
-  // settings page instead of a dead 404.
-  server.sendHeader("Location", cfg_mode ? "/config" : "/");
-  server.send(302, "text/plain", "");
-}
-
-// POST /display?state=on|off  — turn the TFT panel + backlight on/off
-// from the web dashboard (the BOOT button is unusable: it shares GPIO9
-// with TFT_RST on this board).
-void handleDisplay() {
-  if (!server.hasArg("state")) {
-    server.send(400, "application/json; charset=utf-8",
-                "{\"ok\":false,\"msg\":\"missing state\"}");
-    return;
-  }
-  setDisplay(server.arg("state") == "on");
-  String json = "{\"ok\":true,\"display\":\"";
-  json += String(data.display_on ? "on" : "off");
-  json += "\"}";
-  server.send(200, "application/json; charset=utf-8", json);
-}
-
-// GET /config — configuration form page.
-void handleConfigPage() {
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "0");
-  server.send_P(200, "text/html", config_html);
-}
-
-// GET /config/data — current settings as JSON (prefills the form).
-// NOTE: wifi_pass is intentionally never echoed back.
-void handleConfigData() {
-  String json;
-  json.reserve(512);
-  json = "{\"wifi_ssid\":\"";
-  json += String(cfg.wifi_ssid);
-  json += "\",\"device_name\":\"";
-  json += String(cfg.device_name);
-  json += "\",\"clear_pwd\":\"";
-  json += String(cfg.clear_pwd);
-  json += "\",\"ntp_server\":\"";
-  json += String(cfg.ntp_server);
-  json += "\",\"tz_hours\":";
-  json += String((double)cfg.tz_sec / 3600.0, 1);
-  json += ",\"log_interval_s\":";
-  json += String(cfg.log_interval_s);
-  json += ",\"log_retention_days\":";
-  json += String(cfg.log_retention_days);
-  json += ",\"alert_enabled\":";
-  json += cfg.alert_enabled ? "true" : "false";
-  json += ",\"alert_eco2\":";
-  json += String(cfg.alert_eco2);
-  json += ",\"alert_tvoc\":";
-  json += String(cfg.alert_tvoc);
-  json += ",\"alert_aqi\":";
-  json += String(cfg.alert_aqi);
-  json += "}";
-  server.send(200, "application/json; charset=utf-8", json);
-}
-
-// POST /config/save — form-urlencoded body. An empty wifi_pass keeps the
-// current password. WiFi changes trigger a reboot; all other parameters
-// (NTP/timezone/log/alert) apply immediately.
-void handleConfigSave() {
-  bool wifi_changed = false;
-  bool name_changed = false;
-
-  if (server.hasArg("wifi_ssid")) {
-    String s = server.arg("wifi_ssid");
-    s.trim();
-    if (s.length() == 0) {
-      server.send(400, "application/json; charset=utf-8",
-                  "{\"ok\":false,\"msg\":\"SSID 不能为空\"}");
-      return;
-    }
-    if (s != String(cfg.wifi_ssid)) {
-      strncpy(cfg.wifi_ssid, s.c_str(), sizeof(cfg.wifi_ssid) - 1);
-      cfg.wifi_ssid[sizeof(cfg.wifi_ssid) - 1] = '\0';
-      wifi_changed = true;
-    }
-  }
-  if (server.hasArg("wifi_pass") && server.arg("wifi_pass").length() > 0) {
-    String s = server.arg("wifi_pass");
-    if (s != String(cfg.wifi_pass)) {
-      strncpy(cfg.wifi_pass, s.c_str(), sizeof(cfg.wifi_pass) - 1);
-      cfg.wifi_pass[sizeof(cfg.wifi_pass) - 1] = '\0';
-      wifi_changed = true;
-    }
-  }
-  if (server.hasArg("device_name")) {
-    String s = server.arg("device_name");
-    s.trim();
-    if (s.length() > 0 && validHostname(s.c_str()) && s != String(cfg.device_name)) {
-      strncpy(cfg.device_name, s.c_str(), sizeof(cfg.device_name) - 1);
-      cfg.device_name[sizeof(cfg.device_name) - 1] = '\0';
-      name_changed = true;
-    }
-  }
-  if (server.hasArg("clear_pwd")) {
-    String s = server.arg("clear_pwd");
-    s.trim();
-    if (s.length() > 0) {
-      strncpy(cfg.clear_pwd, s.c_str(), sizeof(cfg.clear_pwd) - 1);
-      cfg.clear_pwd[sizeof(cfg.clear_pwd) - 1] = '\0';
-    }
-  }
-  if (server.hasArg("ntp_server")) {
-    String s = server.arg("ntp_server");
-    s.trim();
-    if (s.length() > 0) {
-      strncpy(cfg.ntp_server, s.c_str(), sizeof(cfg.ntp_server) - 1);
-      cfg.ntp_server[sizeof(cfg.ntp_server) - 1] = '\0';
-    }
-  }
-  if (server.hasArg("tz_hours")) {
-    float h = server.arg("tz_hours").toFloat();
-    if (h >= -14.0f && h <= 14.0f) cfg.tz_sec = (int32_t)roundf(h * 3600.0f);
-  }
-  if (server.hasArg("log_interval_s")) {
-    int v = server.arg("log_interval_s").toInt();
-    if (v >= 5 && v <= 3600) cfg.log_interval_s = (uint16_t)v;
-  }
-  if (server.hasArg("log_retention_days")) {
-    int v = server.arg("log_retention_days").toInt();
-    if (v >= 1 && v <= MAX_RETENTION_DAYS) cfg.log_retention_days = (uint16_t)v;
-  }
-  cfg.alert_enabled = server.hasArg("alert_enabled");
-  if (server.hasArg("alert_eco2")) {
-    int v = server.arg("alert_eco2").toInt();
-    if (v >= 0 && v <= 20000) cfg.alert_eco2 = (uint16_t)v;
-  }
-  if (server.hasArg("alert_tvoc")) {
-    int v = server.arg("alert_tvoc").toInt();
-    if (v >= 0 && v <= 60000) cfg.alert_tvoc = (uint16_t)v;
-  }
-  if (server.hasArg("alert_aqi")) {
-    int v = server.arg("alert_aqi").toInt();
-    if (v >= 1 && v <= 5) cfg.alert_aqi = (uint8_t)v;
-  }
-
-  saveSettings();
-
-  if (wifi_changed || name_changed) {
-    // Reboot so setup() re-applies the new credentials / DHCP hostname.
-    server.sendHeader("Cache-Control", "no-cache");
-    server.send(200, "application/json; charset=utf-8",
-                wifi_changed
-                  ? "{\"ok\":true,\"reboot\":true,\"msg\":\"WiFi 已更改,设备即将重启…\"}"
-                  : "{\"ok\":true,\"reboot\":true,\"msg\":\"设备名称已更改,设备即将重启…\"}");
-    delay(400);
-    ESP.restart();
-  } else {
-    reinitNTP();   // apply NTP server / timezone immediately
-    server.sendHeader("Cache-Control", "no-cache");
-    server.send(200, "application/json; charset=utf-8",
-                "{\"ok\":true,\"reboot\":false,\"msg\":\"已保存\"}");
-  }
+  server.send(404, "text/plain", "404");
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1066,7 +650,7 @@ void pruneLogs() {
   struct tm tn;
   localtime_r(&now, &tn);
   tn.tm_hour = 0; tn.tm_min = 0; tn.tm_sec = 0;
-  time_t cutoff = mktime(&tn) - (time_t)(cfg.log_retention_days - 1) * 86400L;
+  time_t cutoff = mktime(&tn) - (time_t)(LOG_RETENTION_DAYS - 1) * 86400L;
 
   File root = LittleFS.open(LOG_DIR);
   if (!root || !root.isDirectory()) return;
@@ -1138,7 +722,7 @@ void handleHistory() {
   int days = 1;
   if (server.hasArg("days")) {
     days = server.arg("days").toInt();
-    if (days < 1 || days > (int)cfg.log_retention_days) days = 1;
+    if (days < 1 || days > LOG_RETENTION_DAYS) days = 1;
   }
 
   // --- window -------------------------------------------------------
@@ -1243,10 +827,10 @@ void handleHistory() {
 // Streams via chunked transfer (chunkResponseBegin/Write/End) so the full
 // 30-day history (~1.7 MB) can be served without building it all in RAM.
 void handleExport() {
-  int days = cfg.log_retention_days;
+  int days = LOG_RETENTION_DAYS;
   if (server.hasArg("days")) {
     days = server.arg("days").toInt();
-    if (days < 1 || days > (int)cfg.log_retention_days) days = cfg.log_retention_days;
+    if (days < 1 || days > LOG_RETENTION_DAYS) days = LOG_RETENTION_DAYS;
   }
   time_t now = time(nullptr);
   time_t start = 0;
@@ -1254,7 +838,7 @@ void handleExport() {
     start = now - (time_t)days * 86400L;
 
   // Collect day-files and sort them oldest → newest (YYYYMMDD sorts lexically).
-  String files[MAX_RETENTION_DAYS + 1];
+  String files[LOG_RETENTION_DAYS + 1];
   int nfiles = 0;
   File root = LittleFS.open(LOG_DIR);
   if (root && root.isDirectory()) {
@@ -1326,7 +910,7 @@ void handleExport() {
 // GET/POST /clear?pwd=...  — delete ALL history files. Requires the
 // CLEAR_PASSWORD. Also resets the in-RAM min/max tracking.
 void handleClear() {
-  if (!server.hasArg("pwd") || server.arg("pwd") != String(cfg.clear_pwd)) {
+  if (!server.hasArg("pwd") || server.arg("pwd") != String(CLEAR_PASSWORD)) {
     server.send(403, "application/json; charset=utf-8",
                 "{\"ok\":false,\"msg\":\"wrong password\"}");
     return;
@@ -1359,128 +943,6 @@ void handleClear() {
   String json = "{\"ok\":true,\"deleted\":" + String(deleted) + "}";
   server.send(200, "application/json; charset=utf-8", json);
   Serial.printf("CLEAR: deleted %d files\n", deleted);
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  CONFIG (LittleFS /cfg.txt)
-// ═══════════════════════════════════════════════════════════════════
-//  Simple "key=value" line file. WebServer::arg() already URL-decodes
-//  form values, so no escaping needed beyond rejecting newlines.
-
-void setDefaults() {
-  strncpy(cfg.wifi_ssid, WIFI_SSID, sizeof(cfg.wifi_ssid) - 1);
-  cfg.wifi_ssid[sizeof(cfg.wifi_ssid) - 1] = '\0';
-  strncpy(cfg.wifi_pass, WIFI_PASSWORD, sizeof(cfg.wifi_pass) - 1);
-  cfg.wifi_pass[sizeof(cfg.wifi_pass) - 1] = '\0';
-  strncpy(cfg.device_name, "AirQuality-Monitor", sizeof(cfg.device_name) - 1);
-  cfg.device_name[sizeof(cfg.device_name) - 1] = '\0';
-  strncpy(cfg.clear_pwd, "1234", sizeof(cfg.clear_pwd) - 1);
-  cfg.clear_pwd[sizeof(cfg.clear_pwd) - 1] = '\0';
-  strncpy(cfg.ntp_server, NTP_SERVER_DEFAULT, sizeof(cfg.ntp_server) - 1);
-  cfg.ntp_server[sizeof(cfg.ntp_server) - 1] = '\0';
-  cfg.tz_sec             = 8 * 3600;   // UTC+8
-  cfg.log_interval_s     = 60;
-  cfg.log_retention_days = 30;
-  cfg.alert_enabled      = true;
-  cfg.alert_eco2         = 1000;
-  cfg.alert_tvoc         = 1000;
-  cfg.alert_aqi          = 3;
-}
-
-// mDNS/DHCP hostname rules: 1–32 chars, letters / digits / hyphen only.
-static bool validHostname(const char *s) {
-  size_t n = strlen(s);
-  if (n == 0 || n > 32) return false;
-  for (size_t i = 0; i < n; i++) {
-    char c = s[i];
-    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-          (c >= '0' && c <= '9') || c == '-')) return false;
-  }
-  return true;
-}
-
-void loadSettings() {
-  setDefaults();
-  File f = LittleFS.open(CFG_FILE, FILE_READ);
-  if (!f) {                       // first boot (or partition wiped) → defaults
-    Serial.println("CFG: none found, writing defaults");
-    saveSettings();
-    return;
-  }
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();                   // drops \r and surrounding whitespace
-    int eq = line.indexOf('=');
-    if (eq <= 0) continue;
-    String key = line.substring(0, eq);
-    String val = line.substring(eq + 1);
-    if      (key == "wifi_ssid")          { strncpy(cfg.wifi_ssid, val.c_str(), sizeof(cfg.wifi_ssid) - 1); cfg.wifi_ssid[sizeof(cfg.wifi_ssid) - 1] = '\0'; }
-    else if (key == "wifi_pass")          { strncpy(cfg.wifi_pass, val.c_str(), sizeof(cfg.wifi_pass) - 1); cfg.wifi_pass[sizeof(cfg.wifi_pass) - 1] = '\0'; }
-    else if (key == "device_name")        { strncpy(cfg.device_name, val.c_str(), sizeof(cfg.device_name) - 1); cfg.device_name[sizeof(cfg.device_name) - 1] = '\0'; }
-    else if (key == "clear_pwd")          { strncpy(cfg.clear_pwd, val.c_str(), sizeof(cfg.clear_pwd) - 1); cfg.clear_pwd[sizeof(cfg.clear_pwd) - 1] = '\0'; }
-    else if (key == "ntp_server")         { strncpy(cfg.ntp_server, val.c_str(), sizeof(cfg.ntp_server) - 1); cfg.ntp_server[sizeof(cfg.ntp_server) - 1] = '\0'; }
-    else if (key == "tz_sec")             cfg.tz_sec             = val.toInt();
-    else if (key == "log_interval_s")     cfg.log_interval_s     = (uint16_t)val.toInt();
-    else if (key == "log_retention_days") cfg.log_retention_days = (uint16_t)val.toInt();
-    else if (key == "alert_enabled")      cfg.alert_enabled      = (val == "1");
-    else if (key == "alert_eco2")         cfg.alert_eco2         = (uint16_t)val.toInt();
-    else if (key == "alert_tvoc")         cfg.alert_tvoc         = (uint16_t)val.toInt();
-    else if (key == "alert_aqi")          cfg.alert_aqi          = (uint8_t)val.toInt();
-  }
-  f.close();
-
-  // sanity clamps so a hand-edited / bogus file can't break things
-  if (cfg.log_interval_s < 5) cfg.log_interval_s = 5;
-  if (cfg.log_retention_days < 1 || cfg.log_retention_days > MAX_RETENTION_DAYS)
-    cfg.log_retention_days = 30;
-  if (cfg.alert_eco2 == 0) cfg.alert_eco2 = 1000;
-  if (cfg.alert_tvoc == 0) cfg.alert_tvoc = 1000;
-  if (cfg.alert_aqi < 1 || cfg.alert_aqi > 5) cfg.alert_aqi = 3;
-  if (!validHostname(cfg.device_name))
-    strncpy(cfg.device_name, "AirQuality-Monitor", sizeof(cfg.device_name) - 1);
-  if (cfg.ntp_server[0] == '\0') strncpy(cfg.ntp_server, NTP_SERVER_DEFAULT, sizeof(cfg.ntp_server) - 1);
-}
-
-void saveSettings() {
-  File f = LittleFS.open(CFG_FILE, FILE_WRITE);
-  if (!f) { Serial.println("CFG: save FAILED"); return; }
-  f.printf("wifi_ssid=%s\n", cfg.wifi_ssid);
-  f.printf("wifi_pass=%s\n", cfg.wifi_pass);
-  f.printf("device_name=%s\n", cfg.device_name);
-  f.printf("clear_pwd=%s\n", cfg.clear_pwd);
-  f.printf("ntp_server=%s\n", cfg.ntp_server);
-  f.printf("tz_sec=%ld\n", (long)cfg.tz_sec);
-  f.printf("log_interval_s=%u\n", (unsigned)cfg.log_interval_s);
-  f.printf("log_retention_days=%u\n", (unsigned)cfg.log_retention_days);
-  f.printf("alert_enabled=%d\n", cfg.alert_enabled ? 1 : 0);
-  f.printf("alert_eco2=%u\n", (unsigned)cfg.alert_eco2);
-  f.printf("alert_tvoc=%u\n", (unsigned)cfg.alert_tvoc);
-  f.printf("alert_aqi=%u\n", (unsigned)cfg.alert_aqi);
-  f.close();
-  Serial.println("CFG: saved");
-}
-
-// Re-apply NTP server + timezone; force a re-sync with the new server.
-void reinitNTP() {
-  configTime(cfg.tz_sec, 0, cfg.ntp_server, NTP_SERVER_FALLBACK);
-  data.time_synced = false;
-}
-
-// Recompute the threshold-alert flag + message (called every ~1 s).
-void computeAlert() {
-  data.alert = false;
-  data.alert_msg[0] = '\0';
-  if (!cfg.alert_enabled || !data.ens160_ok) return;
-  if (data.eco2 > cfg.alert_eco2) {
-    data.alert = true;
-    snprintf(data.alert_msg, sizeof(data.alert_msg), "eCO₂ %u/%u ppm", data.eco2, cfg.alert_eco2);
-  } else if (data.tvoc > cfg.alert_tvoc) {
-    data.alert = true;
-    snprintf(data.alert_msg, sizeof(data.alert_msg), "TVOC %u/%u ppb", data.tvoc, cfg.alert_tvoc);
-  } else if (data.aqi >= cfg.alert_aqi) {
-    data.alert = true;
-    snprintf(data.alert_msg, sizeof(data.alert_msg), "AQI %u (阈值 %u)", data.aqi, cfg.alert_aqi);
-  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1582,276 +1044,65 @@ bool readENS160() {
 
 static const char *AQI_LABEL[] = {"--","Excellent","Good","Moderate","Poor","Unhealthy"};
 
-// RGB565 colour helper.
-static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
-  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-}
-
-static uint16_t aqiColor(uint8_t aqi) {
-  switch (aqi) {
-    case 1: return ST77XX_GREEN;
-    case 2: return rgb565(160, 240, 0);
-    case 3: return ST77XX_YELLOW;
-    case 4: return ST77XX_ORANGE;
-    case 5: return ST77XX_RED;
-    default: return rgb565(140, 148, 168);
-  }
-}
-
-// WiFi signal colour from strength percentage (0-100).
-static uint16_t wifiColor(int pct) {
-  if (pct >= 80) return ST77XX_GREEN;
-  if (pct >= 60) return rgb565(160, 240, 0);
-  if (pct >= 40) return ST77XX_YELLOW;
-  if (pct >= 20) return ST77XX_ORANGE;
-  return ST77XX_RED;
-}
-
-// One 2px-thick top arc drawn with short line segments (a basic primitive,
-// guaranteed to render on any display).
-void tftTopArc(int16_t cx, int16_t cy, int r, uint16_t color) {
-  // upper-left quarter arc (90° top → 180° left) = 90° CCW from before
-  for (int deg = 90; deg < 180; deg += 15) {
-    float a1 = (float)deg * PI / 180.0f;
-    float a2 = (float)(deg + 15) * PI / 180.0f;
-    tft.drawLine(cx + (int)(r * cos(a1)), cy - (int)(r * sin(a1)),
-                 cx + (int)(r * cos(a2)), cy - (int)(r * sin(a2)), color);
-  }
-}
-
-// Classic three-segment WiFi icon (dot + 3 arc bands). The stronger the
-// signal, the more bands are lit. Pass pct = -1 for a dim "off" icon.
-void tftDrawWifiIcon(int16_t x, int16_t y, int pct, uint16_t color) {
-  const uint16_t DIM = rgb565(70, 74, 90);
-  int level = pct >= 70 ? 3 : pct >= 40 ? 2 : pct >= 15 ? 1 : 0;
-  tft.fillCircle(x, y, 2, level > 0 ? color : DIM);
-  tftTopArc(x, y, 3, level >= 1 ? color : DIM);
-  tftTopArc(x, y, 7, level >= 2 ? color : DIM);
-  tftTopArc(x, y, 11, level >= 3 ? color : DIM);
-}
-
-// Static frame of one 2×2 card (background, border, label) — drawn once.
-void tftMetricCardFrame(int16_t x, int16_t y, const char *label) {
-  const uint16_t CARD   = rgb565(22, 24, 38);
-  const uint16_t BORDER = rgb565(52, 56, 76);
-  const uint16_t LABEL  = rgb565(140, 148, 168);
-
-  tft.fillRoundRect(x, y, 112, 64, 8, CARD);
-  tft.drawRoundRect(x, y, 112, 64, 8, BORDER);
-  tft.setTextSize(1);
-  tft.setTextColor(LABEL);
-  tft.setCursor(x + 8, y + 4);
-  tft.print(label);
-}
-
-// Refresh the dynamic text of one card (value/unit + L-min H-max).
-// Background-fill text + clear-rects avoid leftovers and flicker.
-void tftMetricCardValues(int16_t x, int16_t y, const char *unit,
-                         const char *value, const char *mn, const char *mx) {
-  const uint16_t CARD  = rgb565(22, 24, 38);
-  const uint16_t LABEL = rgb565(140, 148, 168);
-  const uint16_t MINC  = rgb565(120, 190, 240);
-  const uint16_t MAXC  = rgb565(255, 150, 120);
-
-  tft.fillRect(x + 6, y + 16, 100, 28, CARD);
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_WHITE, CARD);
-  tft.setCursor(x + 8, y + 18);
-  tft.print(value);
-  tft.setTextSize(1);
-  tft.setTextColor(LABEL, CARD);
-  tft.setCursor(x + 8 + strlen(value) * 12 + 2, y + 24);
-  tft.print(unit);
-
-  tft.fillRect(x + 6, y + 44, 100, 10, CARD);
-  tft.setTextSize(1);
-  tft.setTextColor(MINC, CARD);
-  tft.setCursor(x + 8, y + 46);
-  tft.print("L");
-  tft.setCursor(x + 16, y + 46);
-  tft.print(mn);
-  tft.setTextColor(MAXC, CARD);
-  tft.setCursor(x + 58, y + 46);
-  tft.print("H");
-  tft.setCursor(x + 66, y + 46);
-  tft.print(mx);
-}
-
-// Draw the whole static frame once (background, cards, labels).
-void tftDrawLayout() {
-  const uint16_t BG     = ST77XX_BLACK;
-  const uint16_t CARD   = rgb565(22, 24, 38);
-  const uint16_t BORDER = rgb565(52, 56, 76);
-  const uint16_t LABEL  = rgb565(140, 148, 168);
-
-  tft.fillScreen(BG);
-
-  tft.fillRoundRect(AQI_X, 56, AQI_W, 62, 10, CARD);
-  tft.drawRoundRect(AQI_X, 56, AQI_W, 62, 10, BORDER);
-  tft.setTextSize(1);
-  tft.setTextColor(LABEL);
-  tft.setCursor(AQI_X + (AQI_W - strlen("AIR QUALITY") * 6) / 2, 62);
-  tft.print("AIR QUALITY");
-
-  tftMetricCardFrame(CARD_L, 132, "eCO2");
-  tftMetricCardFrame(CARD_R, 132, "TVOC");
-  tftMetricCardFrame(CARD_L, 208, "TEMP");
-  tftMetricCardFrame(CARD_R, 208, "HUM");
-}
-
-// Called every second — only redraws changed text, never clears the whole
-// screen (that full-screen clear was what caused the flicker).
 void updateDisplay() {
-  const uint16_t BG    = ST77XX_BLACK;
-  const uint16_t CARD  = rgb565(22, 24, 38);
-  const uint16_t LABEL = rgb565(140, 148, 168);
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
 
-  // ── Time ─────────────────────────────────────────────────────
-  tft.fillRect(0, 6, TFT_W, 34, BG);
-  tft.setTextSize(4);
-  tft.setTextColor(data.alert ? ST77XX_RED : ST77XX_WHITE, BG);
-  tft.setCursor((TFT_W - strlen(data.time_str) * 24) / 2, 6);
-  tft.print(data.time_str);
+  // Line 0: Time — centred, size 2
+  display.setTextSize(2);
+  display.setCursor((SCREEN_WIDTH - strlen(data.time_str) * 12) / 2, 0);
+  display.print(data.time_str);
 
-  // ── Date ─────────────────────────────────────────────────────
-  tft.fillRect(0, 40, TFT_W, 8, BG);
-  tft.setTextSize(1);
-  tft.setTextColor(LABEL, BG);
-  if (data.time_synced) {
-    time_t t = time(nullptr);
-    struct tm *ti = localtime(&t);
-    char ds[16];
-    strftime(ds, sizeof(ds), "%Y-%m-%d", ti);
-    tft.setCursor((TFT_W - strlen(ds) * 6) / 2, 40);
-    tft.print(ds);
-  }
-
-  // ── AQI value + label (centred as a group in the banner) ─────
-  tft.fillRect(AQI_X, 74, AQI_W, 34, CARD);
+  // Line 1: AQI
+  display.setTextSize(1);
+  display.setCursor(0, 17);
+  display.print("AQI: ");
   if (data.aqi >= 1 && data.aqi <= 5) {
-    uint16_t c = aqiColor(data.aqi);
-    const char *lbl = AQI_LABEL[data.aqi];
-    int total = 24 + (int)strlen(lbl) * 18 + 8;   // digit(size4) + gap + label(size3)
-    int x0 = AQI_X + (AQI_W - total) / 2;
-    tft.setTextSize(4);
-    tft.setTextColor(c, CARD);
-    tft.setCursor(x0, 76);
-    tft.print(data.aqi);
-    tft.setTextSize(3);
-    tft.setCursor(x0 + 32, 82);
-    tft.print(lbl);
+    display.print(data.aqi);
+    display.print(" ");
+    display.print(AQI_LABEL[data.aqi]);
   } else {
-    int x0 = AQI_X + (AQI_W - 48) / 2;   // "--" centred
-    tft.setTextSize(4);
-    tft.setTextColor(LABEL, CARD);
-    tft.setCursor(x0, 76);
-    tft.print("--");
+    display.print("--");
   }
 
-  // ── metric values + min/max ──────────────────────────────────
-  char b[12], mn[12], mx[12];
+  // Line 2: eCO₂
+  display.setCursor(0, 27);
+  display.print("eCO2: ");
+  if (data.ens160_ok) {
+    display.print(data.eco2);
+    display.print(" ppm");
+  } else {
+    display.print("--");
+  }
 
-  if (data.ens160_ok) snprintf(b, sizeof(b), "%u", data.eco2); else strcpy(b, "--");
-  snprintf(mn, sizeof(mn), "%u", data.eco2_min);
-  snprintf(mx, sizeof(mx), "%u", data.eco2_max);
-  tftMetricCardValues(CARD_L, 132, "ppm", b, mn, mx);
+  // Line 3: TVOC
+  display.setCursor(0, 37);
+  display.print("TVOC: ");
+  if (data.ens160_ok) {
+    display.print(data.tvoc);
+    display.print(" ppb");
+  } else {
+    display.print("--");
+  }
 
-  if (data.ens160_ok) snprintf(b, sizeof(b), "%u", data.tvoc); else strcpy(b, "--");
-  snprintf(mn, sizeof(mn), "%u", data.tvoc_min);
-  snprintf(mx, sizeof(mx), "%u", data.tvoc_max);
-  tftMetricCardValues(CARD_R, 132, "ppb", b, mn, mx);
+  // Line 4: Temperature & Humidity
+  display.setCursor(0, 47);
+  if (data.aht_ok) {
+    display.printf("%.1fC %.0f%%RH", data.temperature, data.humidity);
+  } else {
+    display.print("AHT21 --");
+  }
 
-  if (data.aht_ok) snprintf(b, sizeof(b), "%.1f", data.temperature); else strcpy(b, "--");
-  snprintf(mn, sizeof(mn), data.temp_min > 990 ? "--" : "%.1f", data.temp_min);
-  snprintf(mx, sizeof(mx), data.temp_max < -990 ? "--" : "%.1f", data.temp_max);
-  tftMetricCardValues(CARD_L, 208, "C", b, mn, mx);
-
-  if (data.aht_ok) snprintf(b, sizeof(b), "%.0f", data.humidity); else strcpy(b, "--");
-  snprintf(mn, sizeof(mn), data.hum_min > 990 ? "--" : "%.0f", data.hum_min);
-  snprintf(mx, sizeof(mx), data.hum_max < -990 ? "--" : "%.0f", data.hum_max);
-  tftMetricCardValues(CARD_R, 208, "%", b, mn, mx);
-
-  // ── Bottom area: SSID (line above), IP (centre), % (left), icon (right) ─
-  tft.fillRect(0, 272, TFT_W, 36, BG);
-  tft.setTextSize(1);
+  // Line 5: IP address
+  display.setCursor(0, 56);
+  display.print("IP ");
   if (WiFi.status() == WL_CONNECTED) {
-    int rssi = WiFi.RSSI();
-    int pct  = constrain(map(rssi, -90, -35, 0, 100), 0, 100);
-    uint16_t c = wifiColor(pct);
-
-    // RSSI in dBm (bottom-left, on the SSID row above the %)
-    char rssibuf[12];
-    snprintf(rssibuf, sizeof(rssibuf), "%ddBm", rssi);
-    tft.setTextColor(c, BG);
-    tft.setCursor(4, 278);
-    tft.print(rssibuf);
-
-    // SSID (centred, above the bottom row)
-    tft.setTextColor(ST77XX_GREEN, BG);
-    String ssid = WiFi.SSID();
-    tft.setCursor((TFT_W - ssid.length() * 6) / 2, 278);
-    tft.print(ssid);
-
-    // IP (centred)
-    tft.setTextColor(ST77XX_GREEN, BG);
-    String ip = WiFi.localIP().toString();
-    tft.setCursor((TFT_W - ip.length() * 6) / 2, 296);
-    tft.print(ip);
-
-    // signal % (bottom-left)
-    tft.setTextColor(c, BG);
-    tft.setCursor(4, 296);
-    tft.print(pct);
-    tft.print("%");
-
-    // WiFi icon (bottom-right)
-    tftDrawWifiIcon(TFT_W - 16, 302, pct, c);
-  } else if (cfg_mode) {
-    // AP config hotspot — the device is reachable at 192.168.4.1
-    tft.setTextColor(ST77XX_GREEN, BG);
-    String ap = String("Config: ") + CFG_AP_SSID;
-    tft.setCursor((TFT_W - ap.length() * 6) / 2, 278);
-    tft.print(ap);
-    String aip = WiFi.softAPIP().toString();
-    tft.setCursor((TFT_W - aip.length() * 6) / 2, 296);
-    tft.print(aip);
-    tftDrawWifiIcon(TFT_W - 16, 302, 40, ST77XX_YELLOW);
+    display.print(WiFi.localIP());
   } else {
-    const char *ns = "WiFi: no connection";
-    tft.setTextColor(ST77XX_GREEN, BG);
-    tft.setCursor((TFT_W - strlen(ns) * 6) / 2, 296);
-    tft.print(ns);
-
-    tft.setTextColor(rgb565(140, 148, 168), BG);
-    tft.setCursor(4, 296);
-    tft.print("--%");
-
-    tftDrawWifiIcon(TFT_W - 16, 302, -1, rgb565(70, 74, 90));
+    display.print("--");
   }
-}
 
-// Turn the TFT panel + backlight on/off from the web dashboard.
-void setDisplay(bool on) {
-  if (on == data.display_on) return;
-  data.display_on = on;
-  if (on) {
-    // Wake sequence per ST7789 datasheet: SLPOUT → sleep-out time → DISPON.
-    if (TFT_BL >= 0) digitalWrite(TFT_BL, HIGH);
-    tft.enableSleep(false);      // ST77XX_SLPOUT
-    delay(130);
-    tft.enableDisplay(true);     // ST77XX_DISPON
-    delay(20);
-    tftDrawLayout();
-    updateDisplay();
-  } else {
-    // Sleep sequence per datasheet: Display OFF first, then Sleep In.
-    tft.enableDisplay(false);    // ST77XX_DISPOFF
-    delay(20);
-    tft.enableSleep(true);       // ST77XX_SLPIN
-    delay(20);
-    if (TFT_BL >= 0) digitalWrite(TFT_BL, LOW);
-  }
-  Serial.printf("DISPLAY: %s\n", on ? "ON" : "OFF");
+  display.display();
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1868,39 +1119,27 @@ void setup() {
   Wire.setClock(400000);
   Serial.printf("I²C: SDA=%d  SCL=%d\n", I2C_SDA, I2C_SCL);
 
-  // --- TFT (ST7789 240×320, SPI) ----------------------------------
-  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
-  tft.init(TFT_W, TFT_H);
-  tft.setRotation(0);
-  tft.setTextWrap(false);
-  if (TFT_BL >= 0) {
-    pinMode(TFT_BL, OUTPUT);
-    digitalWrite(TFT_BL, HIGH);
+  // --- OLED -------------------------------------------------------
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("FAIL: SSD1306 not found");
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("AQ Monitor");
+    display.println("Booting...");
+    display.display();
+    Serial.println("OK:  SSD1306");
   }
-  tft.fillScreen(ST77XX_BLACK);
-#if TFT_SELFTEST
-  // Power-on self-test: flash full-screen colours to verify the SPI path.
-  tft.fillScreen(ST77XX_RED);    delay(400);
-  tft.fillScreen(ST77XX_GREEN);  delay(400);
-  tft.fillScreen(ST77XX_BLUE);   delay(400);
-  tft.fillScreen(ST77XX_BLACK);
-#endif
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(28, 40);
-  tft.print("AQ Monitor");
-  tft.setTextSize(1);
-  tft.setCursor(28, 72);
-  tft.print("Booting...");
-  Serial.println("OK:  TFT ST7789");
 
   // --- AHT21 ------------------------------------------------------
   if (!initAHT21()) {
     Serial.println("FAIL: AHT21 not found");
-    tft.setTextSize(1);
-    tft.setTextColor(ST77XX_RED);
-    tft.setCursor(8, 100);
-    tft.print("AHT21 FAIL");
+    display.fillRect(0, 0, 128, 64, 0);
+    display.setCursor(0, 0);
+    display.println("AHT21 FAIL");
+    display.display();
   } else {
     Serial.println("OK:  AHT21");
   }
@@ -1912,74 +1151,34 @@ void setup() {
     Serial.println("OK:  ENS160 (warming up...)");
   }
 
-  // --- Config + storage (LittleFS must be mounted before WiFi) -------
-  initStorage();
-  loadSettings();
-
   // --- WiFi -------------------------------------------------------
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(8, 20);
-  tft.print("Connecting WiFi...");
+  display.fillRect(0, 0, 128, 64, 0);
+  display.setCursor(0, 0);
+  display.println("Connecting WiFi...");
+  display.display();
 
-  // IMPORTANT: setHostname() MUST run before mode(WIFI_STA). The core's
-  // mode() copies the hostname into the STA netif only at the moment STA
-  // is enabled; setHostname() alone never re-applies it afterwards, so
-  // doing it in the other order would leave the default "esp32c3-XXXX".
-  WiFi.setHostname(cfg.device_name);   // DHCP: report friendly name to router
   WiFi.mode(WIFI_STA);
-  WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int dot = 0;
   while (WiFi.status() != WL_CONNECTED) {
     delay(300);
     Serial.print(".");
-    tft.setCursor(8, 36);
-    tft.print("SSID: ");
-    tft.print(cfg.wifi_ssid);
-    tft.setCursor(8, 52);
-    tft.print(dot % 4 == 0 ? "    " : dot % 4 == 1 ? ".   " :
-              dot % 4 == 2 ? "..  " : "... ");
+    display.setCursor(0, 12);
+    display.print("SSID: ");
+    display.print(WIFI_SSID);
+    display.setCursor(0, 24);
+    display.print(dot % 4 == 0 ? "    " : dot % 4 == 1 ? ".   " :
+                  dot % 4 == 2 ? "..  " : "... ");
     dot++;
+    display.display();
     if (dot > 60) {
-      tft.fillScreen(ST77XX_BLACK);
-      tft.setTextColor(ST77XX_RED);
-      tft.setCursor(8, 40);
-      tft.print("WiFi FAIL");
-      tft.setTextColor(ST77XX_WHITE);
-      tft.setCursor(8, 56);
-      tft.print("Check credentials");
+      display.fillRect(0, 0, 128, 64, 0);
+      display.setCursor(0, 0);
+      display.println("WiFi FAIL");
+      display.println("Check credentials");
+      display.display();
       Serial.println("\nFAIL: WiFi connection timeout");
-
-      // Fall back to an AP config hotspot so the device can still be
-      // reconfigured from a phone at http://192.168.4.1
-      WiFi.disconnect(true);          // drop the failed STA attempt cleanly
-      delay(100);
-      WiFi.mode(WIFI_AP);
-      delay(50);
-      if (!WiFi.softAP(CFG_AP_SSID)) { // verify the AP actually came up
-        Serial.println("AP: softAP failed, retrying…");
-        delay(300);
-        WiFi.softAP(CFG_AP_SSID);
-      }
-      cfg_mode = true;
-      // Captive-portal DNS: answer EVERY domain with the device IP, so a
-      // phone's connectivity probe / any typed URL lands on our config page.
-      dns.start(53, "*", WiFi.softAPIP());
-      Serial.printf("AP: SSID=%s IP=%s (config @ http://%s)\n",
-                    CFG_AP_SSID, WiFi.softAPIP().toString().c_str(),
-                    WiFi.softAPIP().toString().c_str());
-      tft.fillScreen(ST77XX_BLACK);
-      tft.setTextColor(ST77XX_WHITE);
-      tft.setCursor(8, 16);
-      tft.print("Config Mode");
-      tft.setCursor(8, 40);
-      tft.print("AP: ");
-      tft.print(CFG_AP_SSID);
-      tft.setCursor(8, 64);
-      tft.print("IP ");
-      tft.print(WiFi.softAPIP());
       break;
     }
   }
@@ -1989,31 +1188,25 @@ void setup() {
                   WiFi.localIP().toString().c_str(),
                   WiFi.gatewayIP().toString().c_str(),
                   WiFi.dnsIP().toString().c_str());
-    tft.fillScreen(ST77XX_BLACK);
-    tft.setTextSize(1);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(8, 16);
-    tft.print("IP  ");
-    tft.print(WiFi.localIP());
-    tft.setCursor(8, 32);
-    tft.print("GW  ");
-    tft.print(WiFi.gatewayIP());
-    tft.setCursor(8, 48);
-    tft.print("DNS ");
-    tft.print(WiFi.dnsIP());
-
-    // --- mDNS: advertise as <device>.local (visible to scanner tools) ---
-    if (MDNS.begin(cfg.device_name)) {
-      Serial.printf("MDNS: %s.local\n", cfg.device_name);
-      MDNS.addService("http", "tcp", 80);   // helps scanner tools (Fing etc.)
-    } else {
-      Serial.println("MDNS: begin failed");
-    }
+    display.fillRect(0, 0, 128, 64, 0);
+    display.setCursor(0, 0);
+    display.print("IP ");
+    display.print(WiFi.localIP());
+    display.setCursor(0, 16);
+    display.print("GW ");
+    display.print(WiFi.gatewayIP());
+    display.setCursor(0, 32);
+    display.print("DNS ");
+    display.print(WiFi.dnsIP());
+    display.display();
 
     // --- NTP time sync (non-blocking: start SNTP, don't wait) -------
     Serial.println("NTP: started (background sync)");
-    reinitNTP();
+    configTime(TZ_OFFSET_SEC, 0, NTP_SERVER1, NTP_SERVER2);
   }
+
+  // --- LittleFS data logging ---------------------------------------
+  initStorage();
 
   // --- Web server (built-in, no external libs) --------------------
   server.on("/",        handleRoot);
@@ -2021,18 +1214,10 @@ void setup() {
   server.on("/ip",      handleIP);
   server.on("/history", handleHistory);
   server.on("/export",  handleExport);
-  server.on("/clear",        handleClear);
-  server.on("/display",      handleDisplay);
-  server.on("/config",       handleConfigPage);
-  server.on("/config/data",  handleConfigData);
-  server.on("/config/save",  handleConfigSave);
+  server.on("/clear",   handleClear);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("Web server started");
-
-  // Draw the main UI frame once, then fill in current values.
-  tftDrawLayout();
-  updateDisplay();
 
   // --- Finish boot screen ------------------------------------------
   delay(1500);
@@ -2047,7 +1232,6 @@ void loop() {
   // Serve web requests FIRST. Keeping this running continuously (never
   // blocked by a sensor read) is what makes the dashboard refresh at ~1 Hz.
   server.handleClient();
-  if (cfg_mode) dns.processNextRequest();   // captive-portal DNS lookups
 
   uint32_t now = millis();
 
@@ -2074,13 +1258,12 @@ void loop() {
     }
 
     readAHT21();
-    computeAlert();
-    if (data.display_on) updateDisplay();   // skip draws while TFT is off
+    updateDisplay();
 
     // Append a log record every LOG_INTERVAL_S (only once time is synced
     // and both sensors have produced valid data).
     if (data.time_synced && data.aht_ok && data.ens160_ok &&
-        now - data.last_log_ms >= (uint32_t)cfg.log_interval_s * 1000UL) {
+        now - data.last_log_ms >= LOG_INTERVAL_S * 1000UL) {
       data.last_log_ms = now;
       appendLogRecord();
     }

@@ -1,0 +1,10 @@
+// WiFi credentials
+// Copy this file to config.h and fill in your own values:
+//   cp config.h.example config.h
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#define WIFI_SSID     "your-ssid"
+#define WIFI_PASSWORD "your-password"
+
+#endif

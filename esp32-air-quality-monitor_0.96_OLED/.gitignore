@@ -1,0 +1,19 @@
+# Arduino build artifacts
+/build/
+/build.tmp/
+__pycache__/
+*.pyc
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Network credentials (in case you ever have a config file)
+*_credentials.h
+config.h
