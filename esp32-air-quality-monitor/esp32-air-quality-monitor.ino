@@ -46,6 +46,8 @@
 #include <WebServer.h>
 #include <DNSServer.h>    // captive-portal DNS for the AP config hotspot
 #include <ESPmDNS.h>      // advertise <device>.local so scanners see a friendly name
+#include <HTTPClient.h>         // ThingSpeak cloud upload
+#include <WiFiClientSecure.h>   // HTTPS for ThingSpeak
 #include <time.h>
 #include <LittleFS.h>
 #include <math.h>
@@ -106,11 +108,17 @@ struct Settings {
   char     ntp_server[65];
   int32_t  tz_sec;                     // timezone offset, seconds
   uint16_t log_interval_s;             // seconds between log records
+  uint16_t log_boot_grace_s;           // seconds after boot before logging starts
   uint16_t log_retention_days;         // ring-buffer retention (calendar days)
   bool     alert_enabled;
   uint16_t alert_eco2;                 // ppm
   uint16_t alert_tvoc;                 // ppb
   uint8_t  alert_aqi;                  // 1..5
+  // ThingSpeak cloud upload
+  bool     cloud_enabled;              // master switch
+  char     ts_api_key[17];             // ThingSpeak write API key (16 chars)
+  char     ts_channel[9];              // ThingSpeak channel number
+  uint16_t cloud_interval_s;           // upload interval (>= 15 s)
 };
 
 Settings cfg;
@@ -149,6 +157,8 @@ struct {
   uint32_t last_ens_poll_ms = 0;  // ENS160 non-blocking poll (~200 ms)
   uint32_t last_log_ms      = 0;  // data log record (every LOG_INTERVAL_S)
   uint32_t last_prune_ms    = 0;  // log retention cleanup (hourly)
+  uint32_t boot_ms          = 0;  // millis() at boot (log warm-up grace)
+  uint32_t last_cloud_ms    = 0;  // ThingSpeak upload (every cloud_interval_s)
   // Min/Max tracking
   float    temp_min = 999.0f,  temp_max = -999.0f;
   float    hum_min  = 999.0f,  hum_max  = -999.0f;
@@ -365,10 +375,12 @@ const char index_html[] PROGMEM = R"rawliteral(
     <span class="dot"></span><span id="status-text">Connected</span>
   </div>
   <div class="action-row">
-    <a class="export-btn" href="/export" download="aq_log.csv">⬇ 导出 CSV</a>
-    <button class="export-btn" id="display-btn" onclick="toggleDisplay()">⏻ 关闭屏幕</button>
-    <button class="export-btn danger" onclick="clearHistory()">🗑 清除历史</button>
-    <a class="export-btn" href="/config">⚙ 设置</a>
+    <a class="export-btn" href="/export" download="aq_log.csv">⬇ Export CSV</a>
+    <button class="export-btn" id="display-btn" onclick="toggleDisplay()">⏻ Turn off screen
+</button>
+    <button class="export-btn danger" onclick="clearHistory()">🗑 Clear History
+</button>
+    <a class="export-btn" href="/config">⚙ Config</a>
   </div>
 </div>
 
@@ -435,10 +447,10 @@ const char index_html[] PROGMEM = R"rawliteral(
     const btn = document.getElementById('display-btn');
     if (!btn) return;
     if (displayState) {
-      btn.textContent = '⏻ 关闭屏幕';
+      btn.textContent = '⏻ Turn off screen';
       btn.classList.remove('danger');
     } else {
-      btn.textContent = '⏻ 开启屏幕';
+      btn.textContent = '⏻ Turn on screen';
       btn.classList.add('danger');
     }
   }
@@ -725,12 +737,21 @@ const char config_html[] PROGMEM = R"rawliteral(
     <div class="row"><label>NTP 服务器</label><input name="ntp_server" id="ntp_server"></div>
     <div class="row"><label>时区(UTC 偏移,小时)</label><input name="tz_hours" id="tz_hours" type="number" step="0.5" min="-14" max="14"></div>
     <div class="row"><label>日志记录间隔(秒)</label><input name="log_interval_s" id="log_interval_s" type="number" min="5" max="3600"></div>
+    <div class="row"><label>启动后延迟记录(秒)</label><input name="log_boot_grace_s" id="log_boot_grace_s" type="number" min="0" max="3600">
+      <span class="hint">开机后等待 N 秒再开始写日志,跳过传感器预热(ENS160 完全稳定约 180 秒)</span></div>
     <div class="row"><label>日志保留天数</label><input name="log_retention_days" id="log_retention_days" type="number" min="1" max="60"></div>
     <div class="sec">告警阈值</div>
     <div class="row chk"><label>启用告警</label><input name="alert_enabled" id="alert_enabled" type="checkbox"></div>
     <div class="row"><label>eCO₂ 阈值(ppm)</label><input name="alert_eco2" id="alert_eco2" type="number" min="0"></div>
     <div class="row"><label>TVOC 阈值(ppb)</label><input name="alert_tvoc" id="alert_tvoc" type="number" min="0"></div>
     <div class="row"><label>AQI 阈值(1-5)</label><input name="alert_aqi" id="alert_aqi" type="number" min="1" max="5"></div>
+    <div class="sec">云上报 (ThingSpeak)</div>
+    <div class="row chk"><label>启用云上报</label><input name="cloud_enabled" id="cloud_enabled" type="checkbox"></div>
+    <div class="row"><label>Write API Key</label><input name="ts_api_key" id="ts_api_key" maxlength="16" autocomplete="off">
+      <span class="hint">ThingSpeak 通道页的 Write API Key(16 位)</span></div>
+    <div class="row"><label>通道号</label><input name="ts_channel" id="ts_channel" maxlength="8" autocomplete="off"></div>
+    <div class="row"><label>上报间隔(秒)</label><input name="cloud_interval_s" id="cloud_interval_s" type="number" min="15" max="3600">
+      <span class="hint">免费版最少 15 秒一次;需 WiFi 在线、传感器有效且过启动宽限后才上报</span></div>
     <button class="btn" type="submit">保存</button>
   </form>
   <div id="msg"></div>
@@ -749,11 +770,16 @@ const char config_html[] PROGMEM = R"rawliteral(
       document.getElementById('ntp_server').value = d.ntp_server || '';
       document.getElementById('tz_hours').value = d.tz_hours;
       document.getElementById('log_interval_s').value = d.log_interval_s;
+      document.getElementById('log_boot_grace_s').value = d.log_boot_grace_s;
       document.getElementById('log_retention_days').value = d.log_retention_days;
       document.getElementById('alert_enabled').checked = !!d.alert_enabled;
       document.getElementById('alert_eco2').value = d.alert_eco2;
       document.getElementById('alert_tvoc').value = d.alert_tvoc;
       document.getElementById('alert_aqi').value = d.alert_aqi;
+      document.getElementById('cloud_enabled').checked = !!d.cloud_enabled;
+      document.getElementById('ts_api_key').value = d.ts_api_key || '';
+      document.getElementById('ts_channel').value = d.ts_channel || '';
+      document.getElementById('cloud_interval_s').value = d.cloud_interval_s;
     } catch (e) { msg('加载配置失败: ' + e, 'err'); }
   }
 
@@ -916,6 +942,8 @@ void handleConfigData() {
   json += String((double)cfg.tz_sec / 3600.0, 1);
   json += ",\"log_interval_s\":";
   json += String(cfg.log_interval_s);
+  json += ",\"log_boot_grace_s\":";
+  json += String(cfg.log_boot_grace_s);
   json += ",\"log_retention_days\":";
   json += String(cfg.log_retention_days);
   json += ",\"alert_enabled\":";
@@ -926,6 +954,14 @@ void handleConfigData() {
   json += String(cfg.alert_tvoc);
   json += ",\"alert_aqi\":";
   json += String(cfg.alert_aqi);
+  json += ",\"cloud_enabled\":";
+  json += cfg.cloud_enabled ? "true" : "false";
+  json += ",\"ts_api_key\":\"";
+  json += String(cfg.ts_api_key);
+  json += "\",\"ts_channel\":\"";
+  json += String(cfg.ts_channel);
+  json += "\",\"cloud_interval_s\":";
+  json += String(cfg.cloud_interval_s);
   json += "}";
   server.send(200, "application/json; charset=utf-8", json);
 }
@@ -992,6 +1028,10 @@ void handleConfigSave() {
     int v = server.arg("log_interval_s").toInt();
     if (v >= 5 && v <= 3600) cfg.log_interval_s = (uint16_t)v;
   }
+  if (server.hasArg("log_boot_grace_s")) {
+    int v = server.arg("log_boot_grace_s").toInt();
+    if (v >= 0 && v <= 3600) cfg.log_boot_grace_s = (uint16_t)v;
+  }
   if (server.hasArg("log_retention_days")) {
     int v = server.arg("log_retention_days").toInt();
     if (v >= 1 && v <= MAX_RETENTION_DAYS) cfg.log_retention_days = (uint16_t)v;
@@ -1008,6 +1048,21 @@ void handleConfigSave() {
   if (server.hasArg("alert_aqi")) {
     int v = server.arg("alert_aqi").toInt();
     if (v >= 1 && v <= 5) cfg.alert_aqi = (uint8_t)v;
+  }
+  cfg.cloud_enabled = server.hasArg("cloud_enabled");
+  if (server.hasArg("ts_api_key")) {
+    String s = server.arg("ts_api_key");
+    s.trim();
+    if (s.length() <= 16) { strncpy(cfg.ts_api_key, s.c_str(), sizeof(cfg.ts_api_key) - 1); cfg.ts_api_key[sizeof(cfg.ts_api_key) - 1] = '\0'; }
+  }
+  if (server.hasArg("ts_channel")) {
+    String s = server.arg("ts_channel");
+    s.trim();
+    if (s.length() <= 8) { strncpy(cfg.ts_channel, s.c_str(), sizeof(cfg.ts_channel) - 1); cfg.ts_channel[sizeof(cfg.ts_channel) - 1] = '\0'; }
+  }
+  if (server.hasArg("cloud_interval_s")) {
+    int v = server.arg("cloud_interval_s").toInt();
+    if (v >= 15 && v <= 3600) cfg.cloud_interval_s = (uint16_t)v;
   }
 
   saveSettings();
@@ -1393,11 +1448,16 @@ void setDefaults() {
   cfg.ntp_server[sizeof(cfg.ntp_server) - 1] = '\0';
   cfg.tz_sec             = 8 * 3600;   // UTC+8
   cfg.log_interval_s     = 60;
+  cfg.log_boot_grace_s   = 180;   // ENS160 takes ~3 min to fully stabilise
   cfg.log_retention_days = 30;
   cfg.alert_enabled      = true;
   cfg.alert_eco2         = 1000;
   cfg.alert_tvoc         = 1000;
   cfg.alert_aqi          = 3;
+  cfg.cloud_enabled      = false;
+  cfg.ts_api_key[0]      = '\0';
+  cfg.ts_channel[0]      = '\0';
+  cfg.cloud_interval_s   = 60;
 }
 
 // mDNS/DHCP hostname rules: 1–32 chars, letters / digits / hyphen only.
@@ -1434,16 +1494,23 @@ void loadSettings() {
     else if (key == "ntp_server")         { strncpy(cfg.ntp_server, val.c_str(), sizeof(cfg.ntp_server) - 1); cfg.ntp_server[sizeof(cfg.ntp_server) - 1] = '\0'; }
     else if (key == "tz_sec")             cfg.tz_sec             = val.toInt();
     else if (key == "log_interval_s")     cfg.log_interval_s     = (uint16_t)val.toInt();
+    else if (key == "log_boot_grace_s")   cfg.log_boot_grace_s   = (uint16_t)val.toInt();
     else if (key == "log_retention_days") cfg.log_retention_days = (uint16_t)val.toInt();
     else if (key == "alert_enabled")      cfg.alert_enabled      = (val == "1");
     else if (key == "alert_eco2")         cfg.alert_eco2         = (uint16_t)val.toInt();
     else if (key == "alert_tvoc")         cfg.alert_tvoc         = (uint16_t)val.toInt();
     else if (key == "alert_aqi")          cfg.alert_aqi          = (uint8_t)val.toInt();
+    else if (key == "cloud_enabled")      cfg.cloud_enabled      = (val == "1");
+    else if (key == "ts_api_key")         { strncpy(cfg.ts_api_key, val.c_str(), sizeof(cfg.ts_api_key) - 1); cfg.ts_api_key[sizeof(cfg.ts_api_key) - 1] = '\0'; }
+    else if (key == "ts_channel")         { strncpy(cfg.ts_channel, val.c_str(), sizeof(cfg.ts_channel) - 1); cfg.ts_channel[sizeof(cfg.ts_channel) - 1] = '\0'; }
+    else if (key == "cloud_interval_s")   cfg.cloud_interval_s   = (uint16_t)val.toInt();
   }
   f.close();
 
   // sanity clamps so a hand-edited / bogus file can't break things
   if (cfg.log_interval_s < 5) cfg.log_interval_s = 5;
+  if (cfg.log_boot_grace_s > 3600) cfg.log_boot_grace_s = 180;
+  if (cfg.cloud_interval_s < 15 || cfg.cloud_interval_s > 3600) cfg.cloud_interval_s = 60;
   if (cfg.log_retention_days < 1 || cfg.log_retention_days > MAX_RETENTION_DAYS)
     cfg.log_retention_days = 30;
   if (cfg.alert_eco2 == 0) cfg.alert_eco2 = 1000;
@@ -1464,11 +1531,16 @@ void saveSettings() {
   f.printf("ntp_server=%s\n", cfg.ntp_server);
   f.printf("tz_sec=%ld\n", (long)cfg.tz_sec);
   f.printf("log_interval_s=%u\n", (unsigned)cfg.log_interval_s);
+  f.printf("log_boot_grace_s=%u\n", (unsigned)cfg.log_boot_grace_s);
   f.printf("log_retention_days=%u\n", (unsigned)cfg.log_retention_days);
   f.printf("alert_enabled=%d\n", cfg.alert_enabled ? 1 : 0);
   f.printf("alert_eco2=%u\n", (unsigned)cfg.alert_eco2);
   f.printf("alert_tvoc=%u\n", (unsigned)cfg.alert_tvoc);
   f.printf("alert_aqi=%u\n", (unsigned)cfg.alert_aqi);
+  f.printf("cloud_enabled=%d\n", cfg.cloud_enabled ? 1 : 0);
+  f.printf("ts_api_key=%s\n", cfg.ts_api_key);
+  f.printf("ts_channel=%s\n", cfg.ts_channel);
+  f.printf("cloud_interval_s=%u\n", (unsigned)cfg.cloud_interval_s);
   f.close();
   Serial.println("CFG: saved");
 }
@@ -1494,6 +1566,51 @@ void computeAlert() {
     data.alert = true;
     snprintf(data.alert_msg, sizeof(data.alert_msg), "AQI %u (阈值 %u)", data.aqi, cfg.alert_aqi);
   }
+}
+
+// Upload the latest readings to a ThingSpeak channel via HTTPS (blocking,
+// ~1-5 s; free tier minimum is 15 s between updates). Field map:
+//   field1=eCO₂ ppm  field2=TVOC ppb  field3=temp °C  field4=RH %  field5=AQI
+void uploadToCloud() {
+  if (cfg.ts_api_key[0] == '\0' || cfg.ts_channel[0] == '\0') return;
+
+  WiFiClientSecure client;
+  client.setInsecure();               // accept the server cert without pinning
+
+  String url = "https://api.thingspeak.com/update?api_key=";
+  url += cfg.ts_api_key;
+  url += "&field1=";
+  url += String(data.eco2);
+  url += "&field2=";
+  url += String(data.tvoc);
+  url += "&field3=";
+  url += String(data.temperature, 1);
+  url += "&field4=";
+  url += String(data.humidity, 0);
+  url += "&field5=";
+  url += String(data.aqi);
+
+  Serial.printf("CLOUD: channel %s → upload\n", cfg.ts_channel);
+  HTTPClient http;
+  if (!http.begin(client, url)) {
+    Serial.println("CLOUD: HTTP begin failed");
+    return;
+  }
+  http.setTimeout(5000);
+  int code = http.GET();
+  if (code > 0) {
+    String resp = http.getString();
+    resp.trim();
+    // On success ThingSpeak returns the new entry id; on failure it returns "0".
+    if (code == 200 && resp.length() > 0 && resp != "0") {
+      Serial.printf("CLOUD: OK entry=%s\n", resp.c_str());
+    } else {
+      Serial.printf("CLOUD: HTTP %d resp=%s\n", code, resp.c_str());
+    }
+  } else {
+    Serial.printf("CLOUD: request error %d\n", code);
+  }
+  http.end();
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2104,6 +2221,7 @@ void setup() {
 
   // --- Finish boot screen ------------------------------------------
   delay(1500);
+  data.boot_ms = millis();          // start of the log warm-up grace period
   data.last_read_ms = millis();
 }
 
@@ -2145,12 +2263,24 @@ void loop() {
     computeAlert();
     if (data.display_on) updateDisplay();   // skip draws while TFT is off
 
-    // Append a log record every LOG_INTERVAL_S (only once time is synced
-    // and both sensors have produced valid data).
+    // Append a log record every LOG_INTERVAL_S — only once time is synced,
+    // both sensors have produced valid data, AND the boot warm-up grace has
+    // elapsed (skips ENS160's ~3 min stabilisation period).
     if (data.time_synced && data.aht_ok && data.ens160_ok &&
+        now - data.boot_ms >= (uint32_t)cfg.log_boot_grace_s * 1000UL &&
         now - data.last_log_ms >= (uint32_t)cfg.log_interval_s * 1000UL) {
       data.last_log_ms = now;
       appendLogRecord();
+    }
+
+    // Cloud upload (ThingSpeak) — WiFi online, sensors valid, past the
+    // warm-up grace, on the configured interval. Blocking (~1-5 s).
+    if (cfg.cloud_enabled && WiFi.status() == WL_CONNECTED &&
+        data.aht_ok && data.ens160_ok &&
+        now - data.boot_ms >= (uint32_t)cfg.log_boot_grace_s * 1000UL &&
+        now - data.last_cloud_ms >= (uint32_t)cfg.cloud_interval_s * 1000UL) {
+      data.last_cloud_ms = now;
+      uploadToCloud();
     }
 
     // Ring-buffer cleanup: run once right after NTP sync, then hourly.
